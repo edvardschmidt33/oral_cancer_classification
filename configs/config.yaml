@@ -1,0 +1,36 @@
+data:
+  bf_train_dir: dataset/BF/train
+  fl_train_dir: dataset/FL/train
+  bf_test_dir:  dataset/BF/test
+  fl_test_dir:  dataset/FL/test
+  labels_csv:   dataset/train.csv
+  sample_submission_csv: dataset/sampleSubmission.csv
+
+split:
+  n_splits: 3
+  seed: 42
+
+model:
+  backbone: convnextv2_nano.fcmae_ft_in22k_in1k
+  input_channels: 6
+  img_size: 128
+
+training:
+  epochs: 30
+  batch_size: 256
+  num_workers: 4
+  optimizer: AdamW
+  lr: 8.0e-5
+  weight_decay: 0.1
+  scheduler: CosineAnnealingLR
+  eta_min: 1.0e-7
+  mixup_alpha: 0.8
+  cutmix_alpha: 1.0
+  class_weights: [0.61, 0.39]
+  label_smoothing: 0.05
+  freeze_backbone_epochs: 5
+  amp: true
+
+output:
+  checkpoint_dir: outputs/checkpoints
+  submission_dir: outputs/submissions
