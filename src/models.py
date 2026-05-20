@@ -2,42 +2,45 @@ import torch
 import torch.nn as nn
 import timm
 
-
-def create_early_fusion_model(model_name='convnextv2_nano.fcmae_ft_in22k_in1k',
-                              pretrained=True, num_classes=1):
-    """ConvNeXt V2 with a 6-channel stem for paired BF+FL early fusion.
-
-    The first conv is replaced with a 6-channel conv whose first 3 input
-    channels copy the pretrained RGB weights and whose last 3 copy them again
-    so both modalities start from the same ImageNet prior.
+class GatedFusionModel(nn.Module):
+    """Two ConvNeXt V2 encoders (BF + FL) with a GMU (Arevalo et al., 2017)
+    fusing their features via tanh projections and a sigmoid gate.
     """
-    model = timm.create_model(model_name, pretrained=pretrained, num_classes=num_classes)
+    def __init__(self, model_name='convnextv2_nano.fcmae_ft_in22k_in1k',
+                 pretrained=True):
+        super().__init__()
+        self.bf_enc = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+        self.fl_enc = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+        dim = self.bf_enc.num_features  # 640 for Nano
 
-    old_conv = model.stem[0]
-    old_weight = old_conv.weight.data  # [out_ch, 3, kH, kW]
+        # Modality projections (tanh activation, as in the GMU paper)
+        self.bf_proj = nn.Linear(dim, dim)
+        self.fl_proj = nn.Linear(dim, dim)
 
-    new_conv = nn.Conv2d(
-        in_channels=6,
-        out_channels=old_conv.out_channels,
-        kernel_size=old_conv.kernel_size,
-        stride=old_conv.stride,
-        padding=old_conv.padding,
-        bias=old_conv.bias is not None,
-    )
-    with torch.no_grad():
-        new_conv.weight[:, :3] = old_weight
-        new_conv.weight[:, 3:] = old_weight.clone()
-        if old_conv.bias is not None:
-            new_conv.bias.copy_(old_conv.bias)
+        # Gate: takes both raw features, outputs sigmoid weighting
+        self.gate = nn.Linear(dim * 2, dim)
 
-    model.stem[0] = new_conv
-    return model
+        # Classification head (now 640-dim input instead of 1280)
+        self.head = nn.Sequential(
+            nn.LayerNorm(dim), nn.Dropout(0.3),
+            nn.Linear(dim, 256), nn.GELU(), nn.Dropout(0.2),
+            nn.Linear(256, 1),
+        )
 
+    def forward(self, bf, fl):
+        f_bf = self.bf_enc(bf)
+        f_fl = self.fl_enc(fl)
 
-def set_backbone_frozen(model, frozen: bool):
-    """Freeze/unfreeze everything except the classifier head."""
-    head = model.get_classifier()
-    head_params = {id(p) for p in head.parameters()}
-    for p in model.parameters():
-        if id(p) not in head_params:
+        # GMU: project through tanh, gate with sigmoid, weighted sum
+        h_bf = torch.tanh(self.bf_proj(f_bf))
+        h_fl = torch.tanh(self.fl_proj(f_fl))
+        z = torch.sigmoid(self.gate(torch.cat([f_bf, f_fl], dim=1)))
+        fused = z * h_bf + (1 - z) * h_fl  # [B, 640]
+
+        return self.head(fused)
+
+    def set_encoders_frozen(self, frozen: bool):
+        for p in self.bf_enc.parameters():
+            p.requires_grad = not frozen
+        for p in self.fl_enc.parameters():
             p.requires_grad = not frozen

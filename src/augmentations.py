@@ -1,5 +1,4 @@
 import torchvision.transforms as T
-from torchvision.transforms import RandAugment
 
 
 def build_bf_color_transform():
@@ -10,7 +9,6 @@ def build_bf_color_transform():
             T.RandomSolarize(threshold=100, p=1.0),
         ], p=[0.4, 0.2, 0.4]),
         T.ColorJitter(brightness=0.5, contrast=0.2, saturation=0.2, hue=0.2),
-        RandAugment(num_ops=2, magnitude=9),
     ])
 
 
@@ -25,9 +23,4 @@ def build_shared_geo_transform():
     return T.Compose([
         T.RandomHorizontalFlip(p=0.5),
         T.RandomVerticalFlip(p=0.5),
-        T.RandomRotation(degrees=180),
     ])
-
-
-def build_eval_transform():
-    return None

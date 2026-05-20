@@ -6,7 +6,7 @@ import torch
 
 
 class OralCancerDataset(Dataset):
-    """Loads paired BF + FL images and returns a 6-channel tensor."""
+    """Returns (bf_tensor, fl_tensor, label, filename)."""
     def __init__(self, filenames, labels, bf_dir, fl_dir,
                  bf_transform=None, fl_transform=None, geo_transform=None):
         self.filenames = filenames
@@ -35,7 +35,6 @@ class OralCancerDataset(Dataset):
 
         bf = T.ToTensor()(bf) if not isinstance(bf, torch.Tensor) else bf
         fl = T.ToTensor()(fl) if not isinstance(fl, torch.Tensor) else fl
-        x = torch.cat([bf, fl], dim=0)
 
         label = torch.tensor(self.labels[index], dtype=torch.float32) if self.labels is not None else -1
-        return x, label, fname
+        return bf, fl, label, fname

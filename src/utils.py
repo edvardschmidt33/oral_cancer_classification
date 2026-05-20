@@ -16,11 +16,11 @@ def extract_patient_id(filename):
     return m.group(1)
 
 
-def get_patient_splits(filenames, labels, n_splits=3, seed=42):
-    """Group cells by patient, then stratified k-fold over patients.
+def get_patient_splits(filenames, labels, n_folds=3, seed=42):
+    """Stratified k-fold on patients (not cells).
 
-    Returns a list of (train_idx, val_idx) tuples indexing into `filenames`.
-    Cells from the same patient never cross train/val boundaries.
+    Returns list of (train_indices, val_indices) tuples indexing into `filenames`.
+    Cells from the same patient never cross the train/val boundary.
     """
     patient_to_indices = defaultdict(list)
     for i, fname in enumerate(filenames):
@@ -29,7 +29,7 @@ def get_patient_splits(filenames, labels, n_splits=3, seed=42):
     patient_ids = sorted(patient_to_indices.keys())
     patient_labels = np.array([labels[patient_to_indices[pid][0]] for pid in patient_ids])
 
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
     folds = []
     for fold_idx, (tr_pat, va_pat) in enumerate(skf.split(patient_ids, patient_labels)):
         train_pids = {patient_ids[i] for i in tr_pat}

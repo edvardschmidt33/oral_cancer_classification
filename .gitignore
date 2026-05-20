@@ -1,3 +1,4 @@
 plan.md
 dataset/*
 .DS_Store
+src/__pycache__
