@@ -2,3 +2,4 @@ plan.md
 dataset/*
 .DS_Store
 src/__pycache__
+run.ipynb

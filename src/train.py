@@ -163,6 +163,11 @@ def main():
     parser.add_argument('--fold', type=int, default=0)
     parser.add_argument('--smoke', action='store_true',
                         help='Single forward pass on one batch, then exit.')
+    parser.add_argument('--wandb', action='store_true',
+                        help='Log to Weights & Biases.')
+    parser.add_argument('--wandb-project', default='oral-cancer-classification')
+    parser.add_argument('--wandb-run-name', default=None,
+                        help='Defaults to "fold{N}".')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -195,6 +200,16 @@ def main():
             logits = model(bf, fl)
         print(f"smoke: bf {tuple(bf.shape)}, fl {tuple(fl.shape)} -> logits {tuple(logits.shape)}")
         return
+
+    use_wandb = args.wandb
+    if use_wandb:
+        import wandb
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name or f'fold{args.fold}',
+            config={**cfg, 'fold': args.fold},
+            tags=[f'fold{args.fold}'],
+        )
 
     epochs = cfg['training']['epochs']
     freeze_epochs = cfg['training']['freeze_backbone_epochs']
@@ -239,6 +254,18 @@ def main():
             lbl, mp, n = per_patient[pid]
             print(f"    pat_{pid} (label={lbl}, n={n}): mean_prob={mp:.3f}")
 
+        if use_wandb:
+            log = {
+                'epoch': epoch,
+                'train/loss': train_loss,
+                'val/auc': val_auc,
+                'lr': lr_now,
+            }
+            for pid, (lbl, mp, n) in per_patient.items():
+                log[f'val/pat_{pid}_mean_prob'] = mp
+                log[f'val/pat_{pid}_label'] = lbl
+            wandb.log(log)
+
         if val_auc > best_auc:
             best_auc = val_auc
             torch.save({
@@ -249,8 +276,13 @@ def main():
                 'config': cfg,
             }, best_path)
             print(f"    -> new best (auc={val_auc:.4f}), saved to {best_path}")
+            if use_wandb:
+                wandb.summary['best_val_auc'] = best_auc
+                wandb.summary['best_epoch'] = epoch
 
     print(f"fold {args.fold} done. best val AUC: {best_auc:.4f}")
+    if use_wandb:
+        wandb.finish()
 
 
 if __name__ == '__main__':
