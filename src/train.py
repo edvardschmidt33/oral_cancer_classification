@@ -47,20 +47,23 @@ def build_dataloaders(cfg, train_idx, val_idx, filenames, labels):
         bf_dir=cfg['data']['bf_train_dir'],
         fl_dir=cfg['data']['fl_train_dir'],
     )
+    num_workers = cfg['training']['num_workers']
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg['training']['batch_size'],
         shuffle=True,
-        num_workers=cfg['training']['num_workers'],
+        num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
+        persistent_workers=num_workers > 0,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=cfg['training']['batch_size'],
         shuffle=False,
-        num_workers=cfg['training']['num_workers'],
+        num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=num_workers > 0,
     )
     return train_loader, val_loader
 
