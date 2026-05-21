@@ -15,17 +15,17 @@ model:
   img_size: 128
 
 training:
-  epochs: 8
+  epochs: 10
   batch_size: 256
-  num_workers: 4
+  num_workers: 2
   optimizer: AdamW
   lr: 8.0e-5
-  weight_decay: 0.1
+  weight_decay: 0.3
   scheduler: CosineAnnealingLR
   eta_min: 1.0e-7
   mixup_alpha: 0.8
   class_weights: [0.61, 0.39]
-  freeze_backbone_epochs: 3
+  freeze_backbone_epochs: 1
 
 output:
   checkpoint_dir: outputs/checkpoints

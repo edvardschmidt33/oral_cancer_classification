@@ -215,7 +215,7 @@ def main():
     freeze_epochs = cfg['training']['freeze_backbone_epochs']
     use_amp = device.type == 'cuda'
 
-    model.set_encoders_frozen(True)
+    model.set_encoders_freeze_strategy('full')
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=cfg['training']['lr'],
@@ -233,10 +233,10 @@ def main():
 
     for epoch in range(epochs):
         if epoch == freeze_epochs:
-            print(f"epoch {epoch}: unfreezing encoders")
-            model.set_encoders_frozen(False)
+            print(f"epoch {epoch}: switching encoders to partial unfreeze (stages 2-3 + norms)")
+            model.set_encoders_freeze_strategy('partial')
             optimizer = torch.optim.AdamW(
-                model.parameters(),
+                [p for p in model.parameters() if p.requires_grad],
                 lr=cfg['training']['lr'],
                 weight_decay=cfg['training']['weight_decay'],
             )
