@@ -3,3 +3,4 @@ dataset/*
 .DS_Store
 src/__pycache__
 run.ipynb
+early_fusion_ca_plan.md

@@ -6,6 +6,7 @@ sampleSubmission.csv (Name, Diagnosis).
 
 Run with:
     python -m src.inference --config configs/config.yaml --folds 0 1 2
+    python -m src.inference --config configs/config.yaml --folds 0 1 2 --ckpt last
 """
 import argparse
 import os
@@ -17,12 +18,30 @@ import yaml
 from torch.utils.data import DataLoader
 
 from src.dataset import OralCancerDataset
-from src.models import GatedFusionModel
+from src.models import CrossAttentionFusionModel, GatedFusionModel
 
 
 def load_config(path):
     with open(path, 'r') as f:
         return yaml.safe_load(f)
+
+
+def build_model(cfg, pretrained=False):
+    model_type = cfg['model'].get('type', 'gated')
+    if model_type == 'cross_attention':
+        return CrossAttentionFusionModel(
+            backbone_name=cfg['model']['backbone'],
+            pretrained=pretrained,
+            proj_dim=cfg['model'].get('proj_dim', 64),
+            num_heads=cfg['model'].get('num_heads', 4),
+            window_size=cfg['model'].get('window_size', 3),
+        )
+    if model_type == 'gated':
+        return GatedFusionModel(
+            model_name=cfg['model']['backbone'],
+            pretrained=pretrained,
+        )
+    raise ValueError(f"unknown model.type: {model_type!r}")
 
 
 def build_test_loader(cfg):
@@ -63,8 +82,10 @@ def main():
     parser.add_argument('--config', default='configs/config.yaml')
     parser.add_argument('--folds', type=int, nargs='+', default=[0, 1, 2],
                         help='Fold checkpoint indices to load and average.')
+    parser.add_argument('--ckpt', choices=['best', 'last'], default='best',
+                        help='Which per-fold checkpoint to load: best-AUC or final-epoch.')
     parser.add_argument('--output', default=None,
-                        help='Submission path. Defaults to <submission_dir>/submission.csv.')
+                        help='Submission path. Defaults to <submission_dir>/submission_<ckpt>.csv.')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -75,14 +96,11 @@ def main():
 
     fold_probs = []
     for fold in args.folds:
-        ckpt_path = os.path.join(cfg['output']['checkpoint_dir'], f'fold{fold}_best.pt')
+        ckpt_path = os.path.join(cfg['output']['checkpoint_dir'], f'fold{fold}_{args.ckpt}.pt')
         print(f"loading {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
-        model = GatedFusionModel(
-            model_name=cfg['model']['backbone'],
-            pretrained=False,  # weights are overwritten by the checkpoint
-        ).to(device)
+        model = build_model(cfg, pretrained=False).to(device)
         model.load_state_dict(ckpt['model_state'])
 
         probs = predict(model, device, loader)
@@ -94,7 +112,7 @@ def main():
 
     out_dir = cfg['output']['submission_dir']
     os.makedirs(out_dir, exist_ok=True)
-    out_path = args.output or os.path.join(out_dir, 'submission.csv')
+    out_path = args.output or os.path.join(out_dir, f'submission_{args.ckpt}.csv')
     pd.DataFrame({'Name': filenames, 'Diagnosis': avg}).to_csv(out_path, index=False)
     print(f"wrote {len(filenames)} predictions to {out_path}")
 

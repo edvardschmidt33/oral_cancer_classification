@@ -1,0 +1,36 @@
+data:
+  bf_train_dir: dataset/BF/train
+  fl_train_dir: dataset/FL/train
+  bf_test_dir:  dataset/BF/test
+  fl_test_dir:  dataset/FL/test
+  labels_csv:   dataset/train.csv
+  sample_submission_csv: dataset/sampleSubmission.csv
+
+split:
+  n_folds: 3
+  seed: 42
+
+model:
+  type: cross_attention
+  backbone: convnextv2_tiny.fcmae_ft_in22k_in1k
+  img_size: 128
+  proj_dim: 64
+  num_heads: 4
+  window_size: 3
+
+training:
+  epochs: 10
+  batch_size: 64
+  num_workers: 4
+  optimizer: AdamW
+  lr: 8.0e-5
+  weight_decay: 0.1
+  scheduler: CosineAnnealingLR
+  eta_min: 1.0e-7
+  mixup_alpha: 0.8
+  class_weights: [0.61, 0.39]
+  freeze_backbone_epochs: 2
+
+output:
+  checkpoint_dir: outputs/checkpoints
+  submission_dir: outputs/submissions

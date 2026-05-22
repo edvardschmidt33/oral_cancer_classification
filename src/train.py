@@ -22,8 +22,30 @@ from src.augmentations import (
     build_fl_color_transform,
     build_shared_geo_transform,
 )
-from src.models import GatedFusionModel
+from src.models import CrossAttentionFusionModel, GatedFusionModel
 from src.utils import extract_patient_id, get_patient_splits, set_seed
+
+
+def build_model(cfg):
+    """Return (model, set_freeze, freeze_keys) where freeze_keys is the pair
+    of strategy names for warmup / partial-unfreeze phases."""
+    model_type = cfg['model'].get('type', 'gated')
+    if model_type == 'cross_attention':
+        model = CrossAttentionFusionModel(
+            backbone_name=cfg['model']['backbone'],
+            pretrained=True,
+            proj_dim=cfg['model'].get('proj_dim', 64),
+            num_heads=cfg['model'].get('num_heads', 4),
+            window_size=cfg['model'].get('window_size', 3),
+        )
+        return model, model.set_freeze_strategy, ('warmup', 'partial')
+    if model_type == 'gated':
+        model = GatedFusionModel(
+            model_name=cfg['model']['backbone'],
+            pretrained=True,
+        )
+        return model, model.set_encoders_freeze_strategy, ('full', 'partial')
+    raise ValueError(f"unknown model.type: {model_type!r}")
 
 
 def load_config(path):
@@ -191,10 +213,8 @@ def main():
     train_loader, val_loader = build_dataloaders(cfg, train_idx, val_idx, filenames, labels)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = GatedFusionModel(
-        model_name=cfg['model']['backbone'],
-        pretrained=True,
-    ).to(device)
+    model, set_freeze, (freeze_full, freeze_partial) = build_model(cfg)
+    model = model.to(device)
 
     if args.smoke:
         bf, fl, _y, _ = next(iter(train_loader))
@@ -218,7 +238,7 @@ def main():
     freeze_epochs = cfg['training']['freeze_backbone_epochs']
     use_amp = device.type == 'cuda'
 
-    model.set_encoders_freeze_strategy('full')
+    set_freeze(freeze_full)
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=cfg['training']['lr'],
@@ -233,11 +253,12 @@ def main():
     os.makedirs(ckpt_dir, exist_ok=True)
     best_auc = -1.0
     best_path = os.path.join(ckpt_dir, f'fold{args.fold}_best.pt')
+    last_path = os.path.join(ckpt_dir, f'fold{args.fold}_last.pt')
 
     for epoch in range(epochs):
         if epoch == freeze_epochs:
-            print(f"epoch {epoch}: switching encoders to partial unfreeze (stages 2-3 + norms)")
-            model.set_encoders_freeze_strategy('partial')
+            print(f"epoch {epoch}: switching backbone to partial unfreeze (stages 2-3 + norms)")
+            set_freeze(freeze_partial)
             optimizer = torch.optim.AdamW(
                 [p for p in model.parameters() if p.requires_grad],
                 lr=cfg['training']['lr'],
@@ -283,7 +304,15 @@ def main():
                 wandb.summary['best_val_auc'] = best_auc
                 wandb.summary['best_epoch'] = epoch
 
-    print(f"fold {args.fold} done. best val AUC: {best_auc:.4f}")
+        torch.save({
+            'epoch': epoch,
+            'fold': args.fold,
+            'model_state': model.state_dict(),
+            'val_auc': val_auc,
+            'config': cfg,
+        }, last_path)
+
+    print(f"fold {args.fold} done. best val AUC: {best_auc:.4f} (best: {best_path}, last: {last_path})")
     if use_wandb:
         wandb.finish()
 
