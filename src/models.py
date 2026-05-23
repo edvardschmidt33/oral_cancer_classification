@@ -55,9 +55,12 @@ class GatedFusionModel(nn.Module):
                     raise ValueError(f"unknown freeze strategy: {strategy!r}")
 
 
+### Cros-Attention Network models
+
 class ModalityProjection(nn.Module):
     """Lifts a 3-channel modality to a `out_ch`-dim feature space at full
-    spatial resolution. Learned from scratch."""
+    spatial resolution. Learned from scratch.
+    Here, it expands the channels to 64 from 3 and pereserves the spatial dimensions (128x128)"""
     def __init__(self, in_ch=3, out_ch=64):
         super().__init__()
         self.net = nn.Sequential(
@@ -193,10 +196,10 @@ class CrossAttentionFusionModel(nn.Module):
 
         self.head = nn.Sequential(
             nn.LayerNorm(feat_dim),
-            nn.Dropout(0.4),
+            nn.Dropout(0.4), #higher dropout due to larger risk of overfitting
             nn.Linear(feat_dim, 256),
             nn.GELU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.3), #lower dropout, lower OF risk
             nn.Linear(256, 1),
         )
 

@@ -19,8 +19,9 @@ model:
   window_size: 3
 
 training:
-  epochs: 10
-  batch_size: 32
+  epochs: 5
+  batch_size: 128
+  accum_steps: 2                     # effective batch = batch_size * accum_steps = 256
   num_workers: 4
   optimizer: AdamW
   lr: 8.0e-5

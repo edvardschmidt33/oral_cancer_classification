@@ -111,10 +111,14 @@ def train(model, device, train_loader, optimizer, scaler, cfg, use_amp):
     model.train()
     mixup_alpha = cfg['training']['mixup_alpha']
     class_weights = cfg['training']['class_weights']
+    accum_steps = max(1, int(cfg['training'].get('accum_steps', 1)))
     total_loss = 0.0
     n_batches = 0
 
-    for bf, fl, labels, _ in train_loader:
+    optimizer.zero_grad(set_to_none=True)
+    n_batches_total = len(train_loader)
+
+    for i, (bf, fl, labels, _) in enumerate(train_loader):
         bf = bf.to(device, non_blocking=True)
         fl = fl.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
@@ -123,22 +127,32 @@ def train(model, device, train_loader, optimizer, scaler, cfg, use_amp):
         mixed_targets = lam * lab_a + (1 - lam) * lab_b
         weights = sample_weights(lab_a, lab_b, lam, class_weights, device)
 
-        optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             logits = model(bf, fl).squeeze(1)
             loss = F.binary_cross_entropy_with_logits(
                 logits, mixed_targets, weight=weights
             )
 
-        if use_amp:
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            optimizer.step()
+        # Scale down so accumulated gradient matches the average over accum_steps mini-batches.
+        loss_to_back = loss / accum_steps
 
-        total_loss += loss.item()
+        if use_amp:
+            scaler.scale(loss_to_back).backward()
+        else:
+            loss_to_back.backward()
+
+        # Step on completed accumulation cycles or on the very last batch
+        # (so a trailing partial cycle still contributes).
+        is_step = ((i + 1) % accum_steps == 0) or ((i + 1) == n_batches_total)
+        if is_step:
+            if use_amp:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        total_loss += loss.item()  # per-mini-batch unscaled loss for reporting
         n_batches += 1
 
     return total_loss / max(n_batches, 1)
