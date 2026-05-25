@@ -1,0 +1,51 @@
+data:
+  bf_train_dir: dataset/BF/train
+  fl_train_dir: dataset/FL/train
+  bf_test_dir:  dataset/BF/test
+  fl_test_dir:  dataset/FL/test
+  labels_csv:   dataset/train.csv
+  sample_submission_csv: dataset/sampleSubmission.csv
+
+split:
+  n_folds: 2
+  seed: 42
+
+model:
+  type: early_fusion_concat
+  backbone: convnextv2_tiny.fcmae_ft_in22k_in1k
+  img_size: 128
+
+training:
+  epochs: 5
+  batch_size: 128
+  accum_steps: 2                     # effective batch = batch_size * accum_steps
+  num_workers: 4
+  optimizer: AdamW
+  lr: 8.0e-5
+  weight_decay: 0.1
+  scheduler: CosineAnnealingLR
+  eta_min: 1.0e-7
+  mixup_alpha: 0.8
+  class_weights: [0.61, 0.39]
+  freeze_backbone_epochs: 1
+
+pretraining:
+  enabled: true                      # if true, train.py loads the pretrained backbone before supervised training
+  epochs: 5
+  batch_size: 64
+  accum_steps: 4                      # effective batch = batch_size * accum_steps = 256
+  num_workers: 4
+  lr: 1.0e-4
+  weight_decay: 0.05
+  temperature: 0.1
+  proj_dim: 128                       # NT-Xent projection-head output dim
+  proj_hidden_dim: 512                # NT-Xent projection-head hidden dim
+  freeze_strategy: none              # 'partial' (stages 2-3 + stem) | 'none' (all trainable)
+  checkpoint_path: outputs/checkpoints/pretrained_ef_backbone.pt
+
+inference:
+  tta: true                           # 8-view D4 (rotations + h-flip) averaged at test time
+
+output:
+  checkpoint_dir: outputs/checkpoints
+  submission_dir: outputs/submissions

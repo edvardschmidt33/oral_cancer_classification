@@ -3,6 +3,7 @@ from PIL import Image
 import torchvision.transforms as T
 from torch.utils.data import Dataset
 import torch
+import numpy as np
 
 
 class OralCancerDataset(Dataset):
@@ -38,3 +39,34 @@ class OralCancerDataset(Dataset):
 
         label = torch.tensor(self.labels[index], dtype=torch.float32) if self.labels is not None else -1
         return bf, fl, label, fname
+
+class SimCLRDataset(Dataset):
+    """Returns two augmented views of the same BF+FL pair."""
+    
+    def __init__(self, filenames, bf_dir, fl_dir, transform):
+        self.filenames = filenames
+        self.bf_dir = bf_dir
+        self.fl_dir = fl_dir
+        self.transform = transform  # stochastic — gives different output each call
+    
+    def __getitem__(self, idx):
+        fname = self.filenames[idx]
+        bf = Image.open(os.path.join(self.bf_dir, fname)).convert('RGB')
+        fl = Image.open(os.path.join(self.fl_dir, fname)).convert('RGB')
+        
+        # Stack to 6 channels (as numpy for transforms, or apply separately)
+        bf_np = np.array(bf)
+        fl_np = np.array(fl)
+        
+        # View 1: random augmentation
+        bf1, fl1 = self.transform(bf_np.copy(), fl_np.copy())
+        x1 = torch.cat([bf1, fl1], dim=0)  # [6, 128, 128]
+        
+        # View 2: different random augmentation of same cell
+        bf2, fl2 = self.transform(bf_np.copy(), fl_np.copy())
+        x2 = torch.cat([bf2, fl2], dim=0)  # [6, 128, 128]
+        
+        return x1, x2
+    
+    def __len__(self):
+        return len(self.filenames)

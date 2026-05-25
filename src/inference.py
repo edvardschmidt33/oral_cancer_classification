@@ -18,7 +18,11 @@ import yaml
 from torch.utils.data import DataLoader
 
 from src.dataset import OralCancerDataset
-from src.models import CrossAttentionFusionModel, GatedFusionModel
+from src.models import (
+    CrossAttentionFusionModel,
+    EarlyFusionConcatModel,
+    GatedFusionModel,
+)
 
 
 def load_config(path):
@@ -35,6 +39,11 @@ def build_model(cfg, pretrained=False):
             proj_dim=cfg['model'].get('proj_dim', 64),
             num_heads=cfg['model'].get('num_heads', 4),
             window_size=cfg['model'].get('window_size', 3),
+        )
+    if model_type == 'early_fusion_concat':
+        return EarlyFusionConcatModel(
+            backbone_name=cfg['model']['backbone'],
+            pretrained=pretrained,
         )
     if model_type == 'gated':
         return GatedFusionModel(
@@ -65,15 +74,39 @@ def build_test_loader(cfg):
     return loader, filenames
 
 
+def _d4_views(x):
+    """Generate the 8 dihedral-group (D4) views of a [B, C, H, W] tensor:
+    4 rotations (0/90/180/270) × {identity, horizontal flip}."""
+    views = []
+    for k in range(4):
+        rot = torch.rot90(x, k, dims=(2, 3))
+        views.append(rot)
+        views.append(torch.flip(rot, dims=(3,)))
+    return views
+
+
 @torch.no_grad()
-def predict(model, device, loader):
+def predict(model, device, loader, use_tta=False):
+    """If `use_tta`, average sigmoid probs over the 8 D4 views (BF and FL
+    transformed in lockstep to preserve their pairing)."""
     model.eval()
     probs = []
     for bf, fl, _label, _fname in loader:
         bf = bf.to(device, non_blocking=True)
         fl = fl.to(device, non_blocking=True)
-        logits = model(bf, fl).squeeze(1)
-        probs.append(torch.sigmoid(logits).float().cpu().numpy())
+
+        if use_tta:
+            bf_views = _d4_views(bf)
+            fl_views = _d4_views(fl)
+            acc = None
+            for b, f in zip(bf_views, fl_views):
+                p = torch.sigmoid(model(b, f).squeeze(1))
+                acc = p if acc is None else acc + p
+            batch_probs = acc / len(bf_views)
+        else:
+            batch_probs = torch.sigmoid(model(bf, fl).squeeze(1))
+
+        probs.append(batch_probs.float().cpu().numpy())
     return np.concatenate(probs)
 
 
@@ -85,11 +118,18 @@ def main():
     parser.add_argument('--ckpt', choices=['best', 'last'], default='best',
                         help='Which per-fold checkpoint to load: best-AUC or final-epoch.')
     parser.add_argument('--output', default=None,
-                        help='Submission path. Defaults to <submission_dir>/submission_<ckpt>.csv.')
+                        help='Submission path. Defaults to <submission_dir>/submission_<ckpt>[_tta].csv.')
+    parser.add_argument('--tta', dest='tta', action='store_true', default=None,
+                        help='Force TTA on (overrides config).')
+    parser.add_argument('--no-tta', dest='tta', action='store_false',
+                        help='Force TTA off (overrides config).')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    use_tta = args.tta if args.tta is not None else bool(cfg.get('inference', {}).get('tta', False))
+    print(f"TTA: {'on (8-view D4)' if use_tta else 'off'}")
 
     loader, filenames = build_test_loader(cfg)
     print(f"test set: {len(filenames)} images")
@@ -103,7 +143,7 @@ def main():
         model = build_model(cfg, pretrained=False).to(device)
         model.load_state_dict(ckpt['model_state'])
 
-        probs = predict(model, device, loader)
+        probs = predict(model, device, loader, use_tta=use_tta)
         fold_probs.append(probs)
         val_auc = ckpt.get('val_auc', float('nan'))
         print(f"  fold {fold}: val_auc={val_auc:.4f}, predicted {len(probs)} cells")
@@ -112,7 +152,8 @@ def main():
 
     out_dir = cfg['output']['submission_dir']
     os.makedirs(out_dir, exist_ok=True)
-    out_path = args.output or os.path.join(out_dir, f'submission_{args.ckpt}.csv')
+    suffix = f'_{args.ckpt}' + ('_tta' if use_tta else '')
+    out_path = args.output or os.path.join(out_dir, f'submission{suffix}.csv')
     pd.DataFrame({'Name': filenames, 'Diagnosis': avg}).to_csv(out_path, index=False)
     print(f"wrote {len(filenames)} predictions to {out_path}")
 

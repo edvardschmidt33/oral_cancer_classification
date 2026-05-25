@@ -7,7 +7,7 @@ data:
   sample_submission_csv: dataset/sampleSubmission.csv
 
 split:
-  n_folds: 3
+  n_folds: 2
   seed: 42
 
 model:
@@ -26,6 +26,9 @@ training:
   mixup_alpha: 0.8
   class_weights: [0.61, 0.39]
   freeze_backbone_epochs: 1
+
+inference:
+  tta: false                          # 8-view D4 (rotations + h-flip) averaged at test time
 
 output:
   checkpoint_dir: outputs/checkpoints

@@ -65,7 +65,7 @@ class ModalityProjection(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, 32, 3, padding=1, bias=False),
-            nn.BatchNorm2d(32),
+            nn.GroupNorm(8, 32),
             nn.GELU(),
             nn.Conv2d(32, out_ch, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_ch),
@@ -234,3 +234,122 @@ class CrossAttentionFusionModel(nn.Module):
                 p.requires_grad = True
             else:
                 raise ValueError(f"unknown freeze strategy: {strategy!r}")
+
+
+### Early-fusion channel-concatenation model
+
+class EarlyFusionConcatModel(nn.Module):
+    """6-channel early fusion: BF and FL are concatenated along the channel
+    dimension and fed to a single ConvNeXt V2-Tiny backbone whose stem has
+    been replaced with a 6-channel patch-embedding conv. The new stem is
+    initialized by duplicating the pretrained 3-channel weights across the
+    BF and FL halves and dividing by 2 to preserve activation magnitude.
+    """
+
+    def __init__(self, backbone_name='convnextv2_tiny.fcmae_ft_in22k_in1k',
+                 pretrained=True):
+        super().__init__()
+        self.backbone = timm.create_model(
+            backbone_name, pretrained=pretrained, num_classes=0,
+        )
+        self._patch_stem_for_6ch()
+        feat_dim = self.backbone.num_features
+
+        self.head = nn.Sequential(
+            nn.LayerNorm(feat_dim),
+            nn.Dropout(0.4),
+            nn.Linear(feat_dim, 256),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 1),
+        )
+
+    def _patch_stem_for_6ch(self):
+        """Replace the 3-channel stem conv with a 6-channel equivalent.
+        Initializes new weight as concat of original|original/2 so the
+        identity-ish behavior on duplicated input is preserved."""
+        stem = self.backbone.stem
+        old_conv = stem[0] if isinstance(stem, nn.Sequential) else stem.conv
+        assert isinstance(old_conv, nn.Conv2d), "unexpected stem layout"
+        assert old_conv.in_channels == 3, f"expected 3-channel stem, got {old_conv.in_channels}"
+
+        new_conv = nn.Conv2d(
+            in_channels=6,
+            out_channels=old_conv.out_channels,
+            kernel_size=old_conv.kernel_size,
+            stride=old_conv.stride,
+            padding=old_conv.padding,
+            bias=old_conv.bias is not None,
+        )
+        with torch.no_grad():
+            w = old_conv.weight  # [C_out, 3, k, k]
+            new_conv.weight.copy_(torch.cat([w, w], dim=1) * 0.5)  # [C_out, 6, k, k]
+            if old_conv.bias is not None:
+                new_conv.bias.copy_(old_conv.bias)
+
+        if isinstance(stem, nn.Sequential):
+            stem[0] = new_conv
+        else:
+            stem.conv = new_conv
+
+    def forward(self, bf, fl):
+        x = torch.cat([bf, fl], dim=1)  # [B, 6, H, W]
+        x = self.backbone(x)            # [B, feat_dim]
+        return self.head(x)
+
+    def set_freeze_strategy(self, strategy: str):
+        """Backbone freeze control. The (6-channel) stem and head stay trainable.
+        - 'warmup':  backbone stages frozen, stem + head train
+        - 'partial': stages 0-1 frozen, stages 2-3 + norms + stem + head train
+        - 'none':    everything trainable
+        """
+        for p in self.head.parameters():
+            p.requires_grad = True
+
+        for name, p in self.backbone.named_parameters():
+            is_stem = name.startswith('stem')
+            if strategy == 'warmup':
+                p.requires_grad = is_stem
+            elif strategy == 'partial':
+                p.requires_grad = (
+                    is_stem
+                    or any(k in name for k in ['stages.2', 'stages.3'])
+                    or ('norm' in name and 'stages.0' not in name and 'stages.1' not in name)
+                )
+            elif strategy == 'none':
+                p.requires_grad = True
+            else:
+                raise ValueError(f"unknown freeze strategy: {strategy!r}")
+            
+
+
+class SimCLRModel(nn.Module):
+    """SimCLR-style wrapper around the 6-channel early-fusion backbone.
+    Forward returns L2-normalized projections for NT-Xent. After pretraining,
+    save `self.backbone.state_dict()` and load it into a fresh
+    `EarlyFusionConcatModel.backbone` for supervised fine-tuning."""
+
+    def __init__(self, backbone_name='convnextv2_tiny.fcmae_ft_in22k_in1k',
+                 pretrained=True, proj_dim=128, proj_hidden_dim=None):
+        super().__init__()
+
+        # Reuse the supervised early-fusion model's stem-patching so the
+        # checkpoint shapes match exactly when loaded by EarlyFusionConcatModel.
+        ef = EarlyFusionConcatModel(backbone_name=backbone_name, pretrained=pretrained)
+        self.backbone = ef.backbone
+
+        feat_dim = self.backbone.num_features
+        if proj_hidden_dim is None:
+            proj_hidden_dim = feat_dim
+
+        # SimCLR projection head (discarded after pretraining)
+        self.proj_head = nn.Sequential(
+            nn.Linear(feat_dim, proj_hidden_dim),
+            nn.GELU(),
+            nn.Linear(proj_hidden_dim, proj_dim),
+        )
+
+    def forward(self, x):
+        h = self.backbone(x)
+        z = self.proj_head(h)
+        return F.normalize(z, dim=1)  # unit norm for cosine similarity

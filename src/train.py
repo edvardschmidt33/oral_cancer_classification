@@ -22,7 +22,11 @@ from src.augmentations import (
     build_fl_color_transform,
     build_shared_geo_transform,
 )
-from src.models import CrossAttentionFusionModel, GatedFusionModel
+from src.models import (
+    CrossAttentionFusionModel,
+    EarlyFusionConcatModel,
+    GatedFusionModel,
+)
 from src.utils import extract_patient_id, get_patient_splits, set_seed
 
 
@@ -37,6 +41,12 @@ def build_model(cfg):
             proj_dim=cfg['model'].get('proj_dim', 64),
             num_heads=cfg['model'].get('num_heads', 4),
             window_size=cfg['model'].get('window_size', 3),
+        )
+        return model, model.set_freeze_strategy, ('warmup', 'partial')
+    if model_type == 'early_fusion_concat':
+        model = EarlyFusionConcatModel(
+            backbone_name=cfg['model']['backbone'],
+            pretrained=True,
         )
         return model, model.set_freeze_strategy, ('warmup', 'partial')
     if model_type == 'gated':
@@ -115,6 +125,11 @@ def train(model, device, train_loader, optimizer, scaler, cfg, use_amp):
     total_loss = 0.0
     n_batches = 0
 
+    # Approximate train-AUC: pair each batch's sigmoid output with the
+    # dominant-side MixUp label (lab_a if lam >= 0.5 else lab_b). Cheap and
+    # avoids a second forward pass; biased slightly toward 0.5 when lam ~ 0.5.
+    all_probs, all_labels = [], []
+
     optimizer.zero_grad(set_to_none=True)
     n_batches_total = len(train_loader)
 
@@ -152,10 +167,22 @@ def train(model, device, train_loader, optimizer, scaler, cfg, use_amp):
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
+        with torch.no_grad():
+            dominant = lab_a if lam >= 0.5 else lab_b
+            all_probs.append(torch.sigmoid(logits).float().detach().cpu().numpy())
+            all_labels.append(dominant.detach().cpu().numpy().astype(int))
+
         total_loss += loss.item()  # per-mini-batch unscaled loss for reporting
         n_batches += 1
 
-    return total_loss / max(n_batches, 1)
+    avg_loss = total_loss / max(n_batches, 1)
+    probs = np.concatenate(all_probs)
+    labels_np = np.concatenate(all_labels)
+    train_auc = (
+        roc_auc_score(labels_np, probs)
+        if len(np.unique(labels_np)) > 1 else float('nan')
+    )
+    return avg_loss, train_auc
 
 
 @torch.no_grad()
@@ -230,6 +257,18 @@ def main():
     model, set_freeze, (freeze_full, freeze_partial) = build_model(cfg)
     model = model.to(device)
 
+    pre = cfg.get('pretraining', {})
+    if pre.get('enabled', False) and cfg['model'].get('type') == 'early_fusion_concat':
+        ckpt_path = pre.get('checkpoint_path')
+        if ckpt_path and os.path.exists(ckpt_path):
+            sd = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+            missing, unexpected = model.backbone.load_state_dict(sd, strict=False)
+            print(f"loaded pretrained backbone from {ckpt_path} "
+                  f"(missing={len(missing)}, unexpected={len(unexpected)})")
+        else:
+            print(f"warning: pretraining.enabled=true but checkpoint not found at {ckpt_path!r}; "
+                  f"continuing with ImageNet-init backbone")
+
     if args.smoke:
         bf, fl, _y, _ = next(iter(train_loader))
         bf, fl = bf.to(device), fl.to(device)
@@ -282,12 +321,12 @@ def main():
                 optimizer, T_max=epochs - epoch, eta_min=cfg['training']['eta_min']
             )
 
-        train_loss = train(model, device, train_loader, optimizer, scaler, cfg, use_amp)
+        train_loss, train_auc = train(model, device, train_loader, optimizer, scaler, cfg, use_amp)
         scheduler.step()
         val_auc, per_patient = test(model, device, val_loader)
 
         lr_now = optimizer.param_groups[0]['lr']
-        print(f"epoch {epoch:02d} | lr {lr_now:.2e} | train_loss {train_loss:.4f} | val_auc {val_auc:.4f}")
+        print(f"epoch {epoch:02d} | lr {lr_now:.2e} | train_loss {train_loss:.4f} | train_auc {train_auc:.4f} | val_auc {val_auc:.4f}")
         for pid in sorted(per_patient):
             lbl, mp, n = per_patient[pid]
             print(f"    pat_{pid} (label={lbl}, n={n}): mean_prob={mp:.3f}")
@@ -296,6 +335,7 @@ def main():
             log = {
                 'epoch': epoch,
                 'train/loss': train_loss,
+                'train/auc': train_auc,
                 'val/auc': val_auc,
                 'lr': lr_now,
             }

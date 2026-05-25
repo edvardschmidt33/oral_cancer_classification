@@ -32,6 +32,9 @@ training:
   class_weights: [0.61, 0.39]
   freeze_backbone_epochs: 2
 
+inference:
+  tta: true                           # 8-view D4 (rotations + h-flip) averaged at test time
+
 output:
   checkpoint_dir: outputs/checkpoints
   submission_dir: outputs/submissions
