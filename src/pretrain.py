@@ -33,9 +33,10 @@ def nt_xent_loss(z1, z2, temperature=0.1):
     z = torch.cat([z1, z2], dim=0)                         # [2B, D]
     sim = z @ z.T / temperature                            # [2B, 2B]
 
-    # Mask out self-similarity on the diagonal.
+    # Mask out self-similarity on the diagonal. Use the dtype's min so this
+    # works under fp16 AMP (where -1e9 overflows).
     diag_mask = torch.eye(2 * B, dtype=torch.bool, device=z.device)
-    sim = sim.masked_fill(diag_mask, -1e9)
+    sim = sim.masked_fill(diag_mask, torch.finfo(sim.dtype).min)
 
     # Positive index for row i: i+B (mod 2B).
     labels = torch.cat([
