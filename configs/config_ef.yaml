@@ -1,13 +1,13 @@
 data:
-  bf_train_dir: dataset/BF/train
-  fl_train_dir: dataset/FL/train
-  bf_test_dir:  dataset/BF/test
-  fl_test_dir:  dataset/FL/test
-  labels_csv:   dataset/train.csv
-  sample_submission_csv: dataset/sampleSubmission.csv
+  bf_train_dir: /root/.cache/kagglehub/competitions/multimodal-cancer-classification-challenge-2026/BF/train
+  fl_train_dir: /root/.cache/kagglehub/competitions/multimodal-cancer-classification-challenge-2026/FL/train
+  bf_test_dir:  /root/.cache/kagglehub/competitions/multimodal-cancer-classification-challenge-2026/BF/test
+  fl_test_dir:  /root/.cache/kagglehub/competitions/multimodal-cancer-classification-challenge-2026/FL/test
+  labels_csv:   /root/.cache/kagglehub/competitions/multimodal-cancer-classification-challenge-2026/train.csv
+  sample_submission_csv: /root/.cache/kagglehub/competitions/multimodal-cancer-classification-challenge-2026/sampleSubmission.csv
 
 split:
-  n_folds: 2
+  n_folds: 3
   seed: 42
 
 model:
@@ -17,30 +17,32 @@ model:
 
 training:
   epochs: 5
-  batch_size: 128
-  accum_steps: 2                     # effective batch = batch_size * accum_steps
-  num_workers: 4
+  batch_size: 256
+  accum_steps: 1                      # effective batch = batch_size * accum_steps = 256
+  num_workers: 8
   optimizer: AdamW
-  lr: 8.0e-5
-  weight_decay: 0.1
+  lr: 2.0e-5                          # lower than ImageNet-init runs since we start from a pretrained-on-distribution backbone
+  weight_decay: 0.3                   # heavy WD to fight per-patient overfitting
   scheduler: CosineAnnealingLR
   eta_min: 1.0e-7
-  mixup_alpha: 0.8
+  mixup_alpha: 1.0
   class_weights: [0.61, 0.39]
   freeze_backbone_epochs: 1
 
 pretraining:
-  enabled: true                      # if true, train.py loads the pretrained backbone before supervised training
-  epochs: 5
-  batch_size: 64
-  accum_steps: 4                      # effective batch = batch_size * accum_steps = 256
-  num_workers: 4
-  lr: 1.0e-4
+  enabled: true                       # if true, train.py loads the pretrained backbone before supervised training
+  epochs: 10
+  batch_size: 512
+  accum_steps: 2                      # effective batch = batch_size * accum_steps = 512 (more negatives → better SimCLR)
+  num_workers: 8
+  prefetch_factor: 4
+  subsample_frac: 1.0                 # A100 is fast enough to use the full pool
+  lr: 1.5e-4
   weight_decay: 0.05
   temperature: 0.1
   proj_dim: 128                       # NT-Xent projection-head output dim
   proj_hidden_dim: 512                # NT-Xent projection-head hidden dim
-  freeze_strategy: none              # 'partial' (stages 2-3 + stem) | 'none' (all trainable)
+  freeze_strategy: partial            # 'partial' (stages 2-3 + stem) | 'none' (all trainable)
   checkpoint_path: outputs/checkpoints/pretrained_ef_backbone.pt
 
 inference:

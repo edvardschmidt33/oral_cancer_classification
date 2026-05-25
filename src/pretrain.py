@@ -48,7 +48,9 @@ def nt_xent_loss(z1, z2, temperature=0.1):
 
 
 def build_loader(cfg):
-    """Pool both train/ and test/ images (no labels needed for SimCLR)."""
+    """Pool both train/ and test/ images (no labels needed for SimCLR).
+    `pretraining.subsample_frac` (optional, in (0, 1]) subsamples the pool
+    deterministically per the split seed — useful for trial runs."""
     bf_train = cfg['data']['bf_train_dir']
     fl_train = cfg['data']['fl_train_dir']
     bf_test = cfg['data']['bf_test_dir']
@@ -59,12 +61,19 @@ def build_loader(cfg):
     train_files = [f for f in train_files if f.lower().endswith('.jpg')]
     test_files = [f for f in test_files if f.lower().endswith('.jpg')]
 
+    pre = cfg['pretraining']
+    subsample = float(pre.get('subsample_frac', 1.0))
+    if 0 < subsample < 1.0:
+        import random
+        rng = random.Random(cfg['split']['seed'])
+        train_files = rng.sample(train_files, int(len(train_files) * subsample))
+        test_files = rng.sample(test_files, int(len(test_files) * subsample))
+
     aug = SimCLRAugmentation()
     train_ds = SimCLRDataset(train_files, bf_train, fl_train, aug)
     test_ds = SimCLRDataset(test_files, bf_test, fl_test, aug)
     dataset = ConcatDataset([train_ds, test_ds])
 
-    pre = cfg['pretraining']
     loader = DataLoader(
         dataset,
         batch_size=pre['batch_size'],
@@ -73,8 +82,10 @@ def build_loader(cfg):
         pin_memory=True,
         drop_last=True,                            # NT-Xent needs a fixed B
         persistent_workers=pre['num_workers'] > 0,
+        prefetch_factor=pre.get('prefetch_factor', 4),
     )
-    print(f"pretraining pool: train={len(train_ds)} + test={len(test_ds)} = {len(dataset)} cells")
+    print(f"pretraining pool: train={len(train_ds)} + test={len(test_ds)} = {len(dataset)} cells"
+          + (f" (subsampled to {subsample:.0%})" if subsample < 1.0 else ""))
     return loader
 
 
