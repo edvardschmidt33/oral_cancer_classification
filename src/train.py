@@ -1,61 +1,34 @@
-"""Training entrypoint for the gated-fusion model.
+"""Training entrypoint for the early-fusion model.
 
 Run with:
-    python -m src.train --config configs/config.yaml --fold 0
-    python -m src.train --config configs/config.yaml --fold 0 --smoke
+    python -m src.train --config configs/config_ef.yaml --fold 0
+    python -m src.train --config configs/config_ef.yaml --fold 0 --smoke
 """
 import argparse
 import os
-from collections import defaultdict
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
 import yaml
-from sklearn.metrics import roc_auc_score
+from sklearn import metrics
 from torch.utils.data import DataLoader
 
-from src.dataset import OralCancerDataset
 from src.augmentations import (
     build_bf_color_transform,
     build_fl_color_transform,
     build_shared_geo_transform,
 )
-from src.models import (
-    CrossAttentionFusionModel,
-    EarlyFusionConcatModel,
-    GatedFusionModel,
+from src.dataset import OralCancerDataset
+from src.models import EarlyFusionConcatModel
+from src.utils import (
+    compute_norm_stats,
+    extract_patient_id,
+    get_patient_splits,
+    probe_fl_channels,
+    set_seed,
 )
-from src.utils import extract_patient_id, get_patient_splits, set_seed
-
-
-def build_model(cfg):
-    """Return (model, set_freeze, freeze_keys) where freeze_keys is the pair
-    of strategy names for warmup / partial-unfreeze phases."""
-    model_type = cfg['model'].get('type', 'gated')
-    if model_type == 'cross_attention':
-        model = CrossAttentionFusionModel(
-            backbone_name=cfg['model']['backbone'],
-            pretrained=True,
-            proj_dim=cfg['model'].get('proj_dim', 64),
-            num_heads=cfg['model'].get('num_heads', 4),
-            window_size=cfg['model'].get('window_size', 3),
-        )
-        return model, model.set_freeze_strategy, ('warmup', 'partial')
-    if model_type == 'early_fusion_concat':
-        model = EarlyFusionConcatModel(
-            backbone_name=cfg['model']['backbone'],
-            pretrained=True,
-        )
-        return model, model.set_freeze_strategy, ('warmup', 'partial')
-    if model_type == 'gated':
-        model = GatedFusionModel(
-            model_name=cfg['model']['backbone'],
-            pretrained=True,
-        )
-        return model, model.set_encoders_freeze_strategy, ('full', 'partial')
-    raise ValueError(f"unknown model.type: {model_type!r}")
 
 
 def load_config(path):
@@ -63,21 +36,34 @@ def load_config(path):
         return yaml.safe_load(f)
 
 
-def build_dataloaders(cfg, train_idx, val_idx, filenames, labels):
+def build_dataloaders(cfg, train_idx, val_idx, filenames, labels,
+                      bf_mean, bf_std, fl_mean, fl_std, fl_channels):
+    size = cfg['model']['img_size']
     train_ds = OralCancerDataset(
         filenames=[filenames[i] for i in train_idx],
         labels=[labels[i] for i in train_idx],
         bf_dir=cfg['data']['bf_train_dir'],
         fl_dir=cfg['data']['fl_train_dir'],
-        bf_transform=build_bf_color_transform(),
-        fl_transform=build_fl_color_transform(),
+        size=size,
+        bf_mean=bf_mean, bf_std=bf_std,
+        fl_mean=fl_mean, fl_std=fl_std,
+        fl_channels=fl_channels,
+        bf_color=build_bf_color_transform(),
+        fl_color=build_fl_color_transform(fl_channels=fl_channels),
         geo_transform=build_shared_geo_transform(),
+        fl_tensor_blur=True,
     )
     val_ds = OralCancerDataset(
         filenames=[filenames[i] for i in val_idx],
         labels=[labels[i] for i in val_idx],
         bf_dir=cfg['data']['bf_train_dir'],
         fl_dir=cfg['data']['fl_train_dir'],
+        size=size,
+        bf_mean=bf_mean, bf_std=bf_std,
+        fl_mean=fl_mean, fl_std=fl_std,
+        fl_channels=fl_channels,
+        bf_color=None, fl_color=None, geo_transform=None,
+        fl_tensor_blur=False,
     )
     num_workers = cfg['training']['num_workers']
     train_loader = DataLoader(
@@ -87,7 +73,7 @@ def build_dataloaders(cfg, train_idx, val_idx, filenames, labels):
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
-        persistent_workers=num_workers > 0,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_ds,
@@ -95,137 +81,90 @@ def build_dataloaders(cfg, train_idx, val_idx, filenames, labels):
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=num_workers > 0,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
     return train_loader, val_loader
 
 
-def mixup_batch(bf, fl, labels, alpha):
-    """Same lambda and permutation applied to both modalities — required to
-    preserve BF–FL pairing under mixup."""
+def mixup(x, y, alpha):
     if alpha <= 0:
-        return bf, fl, labels, labels, 1.0
+        return x, y, y, 1.0
     lam = float(np.random.beta(alpha, alpha))
-    idx = torch.randperm(bf.size(0), device=bf.device)
-    bf = lam * bf + (1 - lam) * bf[idx]
-    fl = lam * fl + (1 - lam) * fl[idx]
-    return bf, fl, labels, labels[idx], lam
+    idx = torch.randperm(x.size(0), device=x.device)
+    return lam * x + (1 - lam) * x[idx], y, y[idx], lam
 
 
-def sample_weights(labels_a, labels_b, lam, class_weights, device):
-    w = torch.tensor(class_weights, dtype=torch.float32, device=device)
-    return lam * w[labels_a.long()] + (1 - lam) * w[labels_b.long()]
+def weighted_bce(logits, y, w_pos, w_neg):
+    """Per-sample weighted BCE: weight is keyed by the target side (y > 0.5).
+    Matches the formulation in EF_convnext_best.py."""
+    w = torch.where(y > 0.5, torch.full_like(y, w_pos), torch.full_like(y, w_neg))
+    return F.binary_cross_entropy_with_logits(logits, y, weight=w)
 
 
-def train(model, device, train_loader, optimizer, scaler, cfg, use_amp):
-    model.train()
-    mixup_alpha = cfg['training']['mixup_alpha']
-    class_weights = cfg['training']['class_weights']
-    accum_steps = max(1, int(cfg['training'].get('accum_steps', 1)))
+def cell_metrics(y, s, threshold=0.5):
+    p = (s > threshold).astype(int)
+    return {
+        'AUC':  metrics.roc_auc_score(y, s) if len(np.unique(y)) > 1 else float('nan'),
+        'F1':   metrics.f1_score(y, p, zero_division=0),
+        'Acc':  metrics.accuracy_score(y, p),
+        'Prec': metrics.precision_score(y, p, zero_division=0),
+        'Rec':  metrics.recall_score(y, p, zero_division=0),
+    }
+
+
+def patient_auc(names, y, s):
+    """Aggregate cell scores to patient level (mean) and compute AUC."""
+    d = pd.DataFrame({'patient': [extract_patient_id(n) for n in names], 'y': y, 's': s})
+    g = d.groupby('patient').agg(y=('y', 'first'), s=('s', 'mean'))
+    if g['y'].nunique() < 2:
+        return float('nan')
+    return metrics.roc_auc_score(g['y'], g['s'])
+
+
+def run_epoch(model, loader, optimizer, scaler, device, train_mode,
+              use_mixup, use_amp, mixup_alpha, w_pos, w_neg):
+    model.train(train_mode)
+    all_y, all_s, all_names = [], [], []
     total_loss = 0.0
-    n_batches = 0
+    for batch in loader:
+        x, y, names = batch
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True).float()
 
-    # Approximate train-AUC: pair each batch's sigmoid output with the
-    # dominant-side MixUp label (lab_a if lam >= 0.5 else lab_b). Cheap and
-    # avoids a second forward pass; biased slightly toward 0.5 when lam ~ 0.5.
-    all_probs, all_labels = [], []
+        if train_mode and use_mixup:
+            x, y_a, y_b, lam = mixup(x, y, alpha=mixup_alpha)
 
-    optimizer.zero_grad(set_to_none=True)
-    n_batches_total = len(train_loader)
+        with torch.set_grad_enabled(train_mode):
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                logits = model(x).squeeze(1)
+                if train_mode and use_mixup:
+                    loss = (lam * weighted_bce(logits, y_a, w_pos, w_neg)
+                            + (1 - lam) * weighted_bce(logits, y_b, w_pos, w_neg))
+                else:
+                    loss = weighted_bce(logits, y, w_pos, w_neg)
 
-    for i, (bf, fl, labels, _) in enumerate(train_loader):
-        bf = bf.to(device, non_blocking=True)
-        fl = fl.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-
-        bf, fl, lab_a, lab_b, lam = mixup_batch(bf, fl, labels, mixup_alpha)
-        mixed_targets = lam * lab_a + (1 - lam) * lab_b
-        weights = sample_weights(lab_a, lab_b, lam, class_weights, device)
-
-        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-            logits = model(bf, fl).squeeze(1)
-            loss = F.binary_cross_entropy_with_logits(
-                logits, mixed_targets, weight=weights
-            )
-
-        # Scale down so accumulated gradient matches the average over accum_steps mini-batches.
-        loss_to_back = loss / accum_steps
-
-        if use_amp:
-            scaler.scale(loss_to_back).backward()
-        else:
-            loss_to_back.backward()
-
-        # Step on completed accumulation cycles or on the very last batch
-        # (so a trailing partial cycle still contributes).
-        is_step = ((i + 1) % accum_steps == 0) or ((i + 1) == n_batches_total)
-        if is_step:
+        if train_mode:
+            optimizer.zero_grad(set_to_none=True)
             if use_amp:
+                scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
+                loss.backward()
                 optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
 
-        with torch.no_grad():
-            dominant = lab_a if lam >= 0.5 else lab_b
-            all_probs.append(torch.sigmoid(logits).float().detach().cpu().numpy())
-            all_labels.append(dominant.detach().cpu().numpy().astype(int))
+        total_loss += loss.item() * x.size(0)
+        all_s.extend(torch.sigmoid(logits.float()).detach().cpu().tolist())
+        all_y.extend(y.detach().cpu().tolist())
+        all_names.extend(names)
 
-        total_loss += loss.item()  # per-mini-batch unscaled loss for reporting
-        n_batches += 1
-
-    avg_loss = total_loss / max(n_batches, 1)
-    probs = np.concatenate(all_probs)
-    labels_np = np.concatenate(all_labels)
-    train_auc = (
-        roc_auc_score(labels_np, probs)
-        if len(np.unique(labels_np)) > 1 else float('nan')
-    )
-    return avg_loss, train_auc
-
-
-@torch.no_grad()
-def test(model, device, val_loader):
-    """Returns (cell_level_auc, per_patient_summary).
-
-    per_patient_summary is a dict pid -> (true_label, mean_prob, n_cells).
-    Labels are constant within a patient (weak supervision), so within-patient
-    AUC is undefined — we report mean predicted prob instead.
-    """
-    model.eval()
-    all_probs, all_labels, all_fnames = [], [], []
-
-    for bf, fl, labels, fnames in val_loader:
-        bf = bf.to(device, non_blocking=True)
-        fl = fl.to(device, non_blocking=True)
-        logits = model(bf, fl).squeeze(1)
-        probs = torch.sigmoid(logits).float().cpu().numpy()
-        all_probs.append(probs)
-        all_labels.append(labels.numpy())
-        all_fnames.extend(fnames)
-
-    probs = np.concatenate(all_probs)
-    labels = np.concatenate(all_labels).astype(int)
-
-    cell_auc = roc_auc_score(labels, probs)
-
-    by_pat = defaultdict(lambda: {'probs': [], 'label': None})
-    for f, p, l in zip(all_fnames, probs, labels):
-        pid = extract_patient_id(f)
-        by_pat[pid]['probs'].append(float(p))
-        by_pat[pid]['label'] = int(l)
-
-    per_patient = {
-        pid: (d['label'], float(np.mean(d['probs'])), len(d['probs']))
-        for pid, d in by_pat.items()
-    }
-    return cell_auc, per_patient
+    avg_loss = total_loss / max(len(loader.dataset), 1)
+    return avg_loss, np.array(all_y), np.array(all_s), all_names
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', default='configs/config.yaml')
+    parser.add_argument('--config', default='configs/config_ef.yaml')
     parser.add_argument('--fold', type=int, default=0)
     parser.add_argument('--smoke', action='store_true',
                         help='Single forward pass on one batch, then exit.')
@@ -239,9 +178,17 @@ def main():
     cfg = load_config(args.config)
     set_seed(cfg['split']['seed'])
 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cuda':
+        torch.backends.cudnn.benchmark = True
+    use_amp = device.type == 'cuda'
+
     labels_df = pd.read_csv(cfg['data']['labels_csv'])
     filenames = labels_df['Name'].tolist()
     labels = labels_df['Diagnosis'].astype(int).tolist()
+
+    fl_channels = probe_fl_channels(cfg['data']['fl_train_dir'])
+    print(f"FL channels detected: {fl_channels}")
 
     folds = get_patient_splits(
         filenames, labels,
@@ -251,14 +198,43 @@ def main():
     train_idx, val_idx = folds[args.fold]
     print(f"fold {args.fold}: {len(train_idx)} train cells, {len(val_idx)} val cells")
 
-    train_loader, val_loader = build_dataloaders(cfg, train_idx, val_idx, filenames, labels)
+    # Class weights from the actual training distribution (inverse frequency).
+    train_labels = np.array([labels[i] for i in train_idx], dtype=int)
+    pos_rate = float(train_labels.mean())
+    neg_rate = 1.0 - pos_rate
+    w_pos, w_neg = float(neg_rate), float(pos_rate)
+    print(f"train cancer rate: {pos_rate:.4f} | W_POS={w_pos:.4f}, W_NEG={w_neg:.4f}")
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model, set_freeze, (freeze_full, freeze_partial) = build_model(cfg)
-    model = model.to(device)
+    # Per-dataset normalization stats from the training names of this fold.
+    train_names = [filenames[i] for i in train_idx]
+    bf_mean, bf_std = compute_norm_stats(
+        cfg['data']['bf_train_dir'], train_names,
+        modality='BF', sample_size=2000, seed=cfg['split']['seed'],
+    )
+    fl_mean, fl_std = compute_norm_stats(
+        cfg['data']['fl_train_dir'], train_names,
+        modality='FL', fl_channels=fl_channels,
+        sample_size=2000, seed=cfg['split']['seed'],
+    )
+    print(f"BF mean: {bf_mean}\nBF std:  {bf_std}")
+    print(f"FL mean: {fl_mean}\nFL std:  {fl_std}")
+
+    train_loader, val_loader = build_dataloaders(
+        cfg, train_idx, val_idx, filenames, labels,
+        bf_mean, bf_std, fl_mean, fl_std, fl_channels,
+    )
+
+    total_channels = 3 + fl_channels
+    model = EarlyFusionConcatModel(
+        backbone_name=cfg['model']['backbone'],
+        pretrained=True,
+        total_channels=total_channels,
+        dropout=cfg['training'].get('dropout', 0.15),
+    ).to(device)
+    print(f"total params: {sum(p.numel() for p in model.parameters()):,}")
 
     pre = cfg.get('pretraining', {})
-    if pre.get('enabled', False) and cfg['model'].get('type') == 'early_fusion_concat':
+    if pre.get('enabled', False):
         ckpt_path = pre.get('checkpoint_path')
         if ckpt_path and os.path.exists(ckpt_path):
             sd = torch.load(ckpt_path, map_location='cpu', weights_only=True)
@@ -270,11 +246,11 @@ def main():
                   f"continuing with ImageNet-init backbone")
 
     if args.smoke:
-        bf, fl, _y, _ = next(iter(train_loader))
-        bf, fl = bf.to(device), fl.to(device)
+        x, _y, _n = next(iter(train_loader))
+        x = x.to(device)
         with torch.no_grad():
-            logits = model(bf, fl)
-        print(f"smoke: bf {tuple(bf.shape)}, fl {tuple(fl.shape)} -> logits {tuple(logits.shape)}")
+            logits = model(x)
+        print(f"smoke: x {tuple(x.shape)} -> logits {tuple(logits.shape)}")
         return
 
     use_wandb = args.wandb
@@ -283,17 +259,16 @@ def main():
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name or f'fold{args.fold}',
-            config={**cfg, 'fold': args.fold},
+            config={**cfg, 'fold': args.fold,
+                    'bf_mean': bf_mean, 'bf_std': bf_std,
+                    'fl_mean': fl_mean, 'fl_std': fl_std,
+                    'w_pos': w_pos, 'w_neg': w_neg},
             tags=[f'fold{args.fold}'],
         )
 
     epochs = cfg['training']['epochs']
-    freeze_epochs = cfg['training']['freeze_backbone_epochs']
-    use_amp = device.type == 'cuda'
-
-    set_freeze(freeze_full)
     optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
+        model.parameters(),
         lr=cfg['training']['lr'],
         weight_decay=cfg['training']['weight_decay'],
     )
@@ -304,69 +279,76 @@ def main():
 
     ckpt_dir = cfg['output']['checkpoint_dir']
     os.makedirs(ckpt_dir, exist_ok=True)
-    best_auc = -1.0
+    best_smoothed = -1.0
     best_path = os.path.join(ckpt_dir, f'fold{args.fold}_best.pt')
     last_path = os.path.join(ckpt_dir, f'fold{args.fold}_last.pt')
+    auc_history = []
+
+    mixup_alpha = cfg['training']['mixup_alpha']
+    use_mixup = mixup_alpha > 0
 
     for epoch in range(epochs):
-        if epoch == freeze_epochs:
-            print(f"epoch {epoch}: switching backbone to partial unfreeze (stages 2-3 + norms)")
-            set_freeze(freeze_partial)
-            optimizer = torch.optim.AdamW(
-                [p for p in model.parameters() if p.requires_grad],
-                lr=cfg['training']['lr'],
-                weight_decay=cfg['training']['weight_decay'],
-            )
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=epochs - epoch, eta_min=cfg['training']['eta_min']
-            )
-
-        train_loss, train_auc = train(model, device, train_loader, optimizer, scaler, cfg, use_amp)
+        tr_loss, _, _, _ = run_epoch(
+            model, train_loader, optimizer, scaler, device,
+            train_mode=True, use_mixup=use_mixup, use_amp=use_amp,
+            mixup_alpha=mixup_alpha, w_pos=w_pos, w_neg=w_neg,
+        )
         scheduler.step()
-        val_auc, per_patient = test(model, device, val_loader)
+        va_loss, y, s, names = run_epoch(
+            model, val_loader, optimizer, scaler, device,
+            train_mode=False, use_mixup=False, use_amp=use_amp,
+            mixup_alpha=0.0, w_pos=w_pos, w_neg=w_neg,
+        )
 
+        m = cell_metrics(y, s)
+        p_auc = patient_auc(names, y, s)
+        auc_history.append(m['AUC'])
+        smoothed = float(np.mean(auc_history[-3:]))
         lr_now = optimizer.param_groups[0]['lr']
-        print(f"epoch {epoch:02d} | lr {lr_now:.2e} | train_loss {train_loss:.4f} | train_auc {train_auc:.4f} | val_auc {val_auc:.4f}")
-        for pid in sorted(per_patient):
-            lbl, mp, n = per_patient[pid]
-            print(f"    pat_{pid} (label={lbl}, n={n}): mean_prob={mp:.3f}")
+
+        print(f"epoch {epoch:02d} | lr {lr_now:.2e} | tr_loss {tr_loss:.4f} | "
+              f"va_loss {va_loss:.4f} | cell_AUC={m['AUC']:.4f} (sm {smoothed:.4f}) | "
+              f"pat_AUC={p_auc:.4f} | F1={m['F1']:.4f} Acc={m['Acc']:.4f}")
 
         if use_wandb:
             log = {
                 'epoch': epoch,
-                'train/loss': train_loss,
-                'train/auc': train_auc,
-                'val/auc': val_auc,
+                'train/loss': tr_loss,
+                'val/loss': va_loss,
+                'val/cell_auc': m['AUC'],
+                'val/cell_auc_smoothed': smoothed,
+                'val/patient_auc': p_auc,
+                'val/f1': m['F1'],
+                'val/acc': m['Acc'],
+                'val/prec': m['Prec'],
+                'val/rec': m['Rec'],
                 'lr': lr_now,
             }
-            for pid, (lbl, mp, n) in per_patient.items():
-                log[f'val/pat_{pid}_mean_prob'] = mp
-                log[f'val/pat_{pid}_label'] = lbl
             wandb.log(log)
 
-        if val_auc > best_auc:
-            best_auc = val_auc
-            torch.save({
-                'epoch': epoch,
-                'fold': args.fold,
-                'model_state': model.state_dict(),
-                'val_auc': val_auc,
-                'config': cfg,
-            }, best_path)
-            print(f"    -> new best (auc={val_auc:.4f}), saved to {best_path}")
-            if use_wandb:
-                wandb.summary['best_val_auc'] = best_auc
-                wandb.summary['best_epoch'] = epoch
-
-        torch.save({
+        ckpt_payload = {
             'epoch': epoch,
             'fold': args.fold,
             'model_state': model.state_dict(),
-            'val_auc': val_auc,
+            'cell_auc': m['AUC'],
+            'smoothed_auc': smoothed,
+            'patient_auc': p_auc,
+            'bf_mean': bf_mean, 'bf_std': bf_std,
+            'fl_mean': fl_mean, 'fl_std': fl_std,
+            'fl_channels': fl_channels,
             'config': cfg,
-        }, last_path)
+        }
+        if smoothed > best_smoothed:
+            best_smoothed = smoothed
+            torch.save(ckpt_payload, best_path)
+            print(f"    -> new best smoothed AUC={smoothed:.4f}, saved to {best_path}")
+            if use_wandb:
+                wandb.summary['best_smoothed_auc'] = best_smoothed
+                wandb.summary['best_epoch'] = epoch
+        torch.save(ckpt_payload, last_path)
 
-    print(f"fold {args.fold} done. best val AUC: {best_auc:.4f} (best: {best_path}, last: {last_path})")
+    print(f"fold {args.fold} done. best smoothed val AUC: {best_smoothed:.4f} "
+          f"(best: {best_path}, last: {last_path})")
     if use_wandb:
         wandb.finish()
 

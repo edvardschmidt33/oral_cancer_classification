@@ -1,12 +1,13 @@
 """Inference: predict on the held-out test set and write submission.csv.
 
-Loads each fold's best checkpoint, runs the test loader, averages sigmoid
-probabilities across folds, and writes a CSV with columns matching
-sampleSubmission.csv (Name, Diagnosis).
+Loads each fold's best checkpoint (which embeds the per-modality normalization
+stats and fl_channels), runs the test loader with optional 4-view TTA
+(identity + h-flip + v-flip + h+v-flip), averages sigmoid probabilities across
+folds, and writes a CSV matching sampleSubmission.csv (Name, Diagnosis).
 
 Run with:
-    python -m src.inference --config configs/config.yaml --folds 0 1 2
-    python -m src.inference --config configs/config.yaml --folds 0 1 2 --ckpt last
+    python -m src.inference --config configs/config_ef.yaml --folds 0 1
+    python -m src.inference --config configs/config_ef.yaml --folds 0 1 --ckpt last
 """
 import argparse
 import os
@@ -18,11 +19,7 @@ import yaml
 from torch.utils.data import DataLoader
 
 from src.dataset import OralCancerDataset
-from src.models import (
-    CrossAttentionFusionModel,
-    EarlyFusionConcatModel,
-    GatedFusionModel,
-)
+from src.models import EarlyFusionConcatModel
 
 
 def load_config(path):
@@ -30,32 +27,7 @@ def load_config(path):
         return yaml.safe_load(f)
 
 
-def build_model(cfg, pretrained=False):
-    model_type = cfg['model'].get('type', 'gated')
-    if model_type == 'cross_attention':
-        return CrossAttentionFusionModel(
-            backbone_name=cfg['model']['backbone'],
-            pretrained=pretrained,
-            proj_dim=cfg['model'].get('proj_dim', 64),
-            num_heads=cfg['model'].get('num_heads', 4),
-            window_size=cfg['model'].get('window_size', 3),
-        )
-    if model_type == 'early_fusion_concat':
-        return EarlyFusionConcatModel(
-            backbone_name=cfg['model']['backbone'],
-            pretrained=pretrained,
-        )
-    if model_type == 'gated':
-        return GatedFusionModel(
-            model_name=cfg['model']['backbone'],
-            pretrained=pretrained,
-        )
-    raise ValueError(f"unknown model.type: {model_type!r}")
-
-
-def build_test_loader(cfg):
-    """Filenames come from sampleSubmission.csv so the output ordering matches
-    the expected submission ordering exactly."""
+def build_test_loader(cfg, bf_mean, bf_std, fl_mean, fl_std, fl_channels):
     sample = pd.read_csv(cfg['data']['sample_submission_csv'])
     filenames = sample['Name'].tolist()
     ds = OralCancerDataset(
@@ -63,6 +35,12 @@ def build_test_loader(cfg):
         labels=None,
         bf_dir=cfg['data']['bf_test_dir'],
         fl_dir=cfg['data']['fl_test_dir'],
+        size=cfg['model']['img_size'],
+        bf_mean=bf_mean, bf_std=bf_std,
+        fl_mean=fl_mean, fl_std=fl_std,
+        fl_channels=fl_channels,
+        bf_color=None, fl_color=None, geo_transform=None,
+        fl_tensor_blur=False,
     )
     loader = DataLoader(
         ds,
@@ -74,49 +52,38 @@ def build_test_loader(cfg):
     return loader, filenames
 
 
-def _d4_views(x):
-    """Generate the 8 dihedral-group (D4) views of a [B, C, H, W] tensor:
-    4 rotations (0/90/180/270) × {identity, horizontal flip}."""
-    views = []
-    for k in range(4):
-        rot = torch.rot90(x, k, dims=(2, 3))
-        views.append(rot)
-        views.append(torch.flip(rot, dims=(3,)))
-    return views
+def tta_views(x):
+    """4-view TTA on the already-normalised concatenated tensor: identity,
+    h-flip, v-flip, both. Same set as EF_convnext_best.py."""
+    return [x,
+            torch.flip(x, dims=[3]),
+            torch.flip(x, dims=[2]),
+            torch.flip(x, dims=[2, 3])]
 
 
 @torch.no_grad()
-def predict(model, device, loader, use_tta=False):
-    """If `use_tta`, average sigmoid probs over the 8 D4 views (BF and FL
-    transformed in lockstep to preserve their pairing)."""
+def predict(model, device, loader, use_tta, use_amp):
     model.eval()
-    probs = []
-    for bf, fl, _label, _fname in loader:
-        bf = bf.to(device, non_blocking=True)
-        fl = fl.to(device, non_blocking=True)
-
-        if use_tta:
-            bf_views = _d4_views(bf)
-            fl_views = _d4_views(fl)
-            acc = None
-            for b, f in zip(bf_views, fl_views):
-                p = torch.sigmoid(model(b, f).squeeze(1))
-                acc = p if acc is None else acc + p
-            batch_probs = acc / len(bf_views)
-        else:
-            batch_probs = torch.sigmoid(model(bf, fl).squeeze(1))
-
-        probs.append(batch_probs.float().cpu().numpy())
-    return np.concatenate(probs)
+    out = []
+    for x, _label, _name in loader:
+        x = x.to(device, non_blocking=True)
+        views = tta_views(x) if use_tta else [x]
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            probs = torch.zeros(x.size(0), device=device)
+            for v in views:
+                probs += torch.sigmoid(model(v).squeeze(1).float())
+            probs /= len(views)
+        out.append(probs.cpu().numpy())
+    return np.concatenate(out)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', default='configs/config.yaml')
-    parser.add_argument('--folds', type=int, nargs='+', default=[0, 1, 2],
+    parser.add_argument('--config', default='configs/config_ef.yaml')
+    parser.add_argument('--folds', type=int, nargs='+', default=[0, 1],
                         help='Fold checkpoint indices to load and average.')
     parser.add_argument('--ckpt', choices=['best', 'last'], default='best',
-                        help='Which per-fold checkpoint to load: best-AUC or final-epoch.')
+                        help='Which per-fold checkpoint to load.')
     parser.add_argument('--output', default=None,
                         help='Submission path. Defaults to <submission_dir>/submission_<ckpt>[_tta].csv.')
     parser.add_argument('--tta', dest='tta', action='store_true', default=None,
@@ -127,26 +94,47 @@ def main():
 
     cfg = load_config(args.config)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    use_amp = device.type == 'cuda'
 
     use_tta = args.tta if args.tta is not None else bool(cfg.get('inference', {}).get('tta', False))
-    print(f"TTA: {'on (8-view D4)' if use_tta else 'off'}")
-
-    loader, filenames = build_test_loader(cfg)
-    print(f"test set: {len(filenames)} images")
+    print(f"TTA: {'on (4-view: flips)' if use_tta else 'off'}")
 
     fold_probs = []
+    filenames = None
     for fold in args.folds:
         ckpt_path = os.path.join(cfg['output']['checkpoint_dir'], f'fold{fold}_{args.ckpt}.pt')
         print(f"loading {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
-        model = build_model(cfg, pretrained=False).to(device)
+        bf_mean = ckpt['bf_mean']
+        bf_std = ckpt['bf_std']
+        fl_mean = ckpt['fl_mean']
+        fl_std = ckpt['fl_std']
+        fl_channels = ckpt['fl_channels']
+        total_channels = 3 + fl_channels
+
+        loader, filenames = build_test_loader(
+            cfg, bf_mean, bf_std, fl_mean, fl_std, fl_channels,
+        )
+
+        model = EarlyFusionConcatModel(
+            backbone_name=cfg['model']['backbone'],
+            pretrained=False,
+            total_channels=total_channels,
+            dropout=cfg['training'].get('dropout', 0.15),
+        ).to(device)
         model.load_state_dict(ckpt['model_state'])
 
-        probs = predict(model, device, loader, use_tta=use_tta)
+        probs = predict(model, device, loader, use_tta=use_tta, use_amp=use_amp)
         fold_probs.append(probs)
-        val_auc = ckpt.get('val_auc', float('nan'))
-        print(f"  fold {fold}: val_auc={val_auc:.4f}, predicted {len(probs)} cells")
+        sauc = ckpt.get('smoothed_auc', float('nan'))
+        cauc = ckpt.get('cell_auc', float('nan'))
+        print(f"  fold {fold}: cell_auc={cauc:.4f}, smoothed_auc={sauc:.4f}, "
+              f"predicted {len(probs)} cells")
+
+        del model
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
 
     avg = np.mean(np.stack(fold_probs, axis=0), axis=0)
 
@@ -156,6 +144,8 @@ def main():
     out_path = args.output or os.path.join(out_dir, f'submission{suffix}.csv')
     pd.DataFrame({'Name': filenames, 'Diagnosis': avg}).to_csv(out_path, index=False)
     print(f"wrote {len(filenames)} predictions to {out_path}")
+    print(f"score stats: min={avg.min():.4f} max={avg.max():.4f} "
+          f"mean={avg.mean():.4f} frac>0.5={(avg > 0.5).mean():.4f}")
 
 
 if __name__ == '__main__':

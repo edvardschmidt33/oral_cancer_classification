@@ -1,8 +1,10 @@
+import os
 import re
 import random
 
 import numpy as np
 import pandas as pd
+from PIL import Image
 from sklearn.model_selection import StratifiedGroupKFold
 
 
@@ -38,7 +40,6 @@ def get_patient_splits(filenames, labels, n_folds=3, seed=42):
     assert (fold_col >= 0).all(), "Some rows were not assigned a fold"
     df['fold'] = fold_col
 
-    # --- diagnostics ---
     print(f"Total rows: {len(df)}")
     print(f"Total patients: {df['patient'].nunique()}")
     print(f"Patients per fold: {df.groupby('fold')['patient'].nunique().to_dict()}")
@@ -80,3 +81,46 @@ def set_seed(seed):
     import torch
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def probe_fl_channels(folder, n=8):
+    """Inspect a few FL images and return the channel count they all share.
+    Asserts on inconsistency."""
+    bands = set()
+    for p in sorted(os.listdir(folder))[:n]:
+        im = Image.open(os.path.join(folder, p))
+        bands.add(im.getbands())
+    band_lens = {len(b) for b in bands}
+    assert len(band_lens) == 1, f'Inconsistent FL channel counts: {bands}'
+    c = band_lens.pop()
+    assert c in (3, 4), f'Unexpected FL channel count: {c}'
+    return c
+
+
+def compute_norm_stats(image_dir, filenames, modality='BF', fl_channels=3,
+                       sample_size=2000, seed=0):
+    """Per-channel mean/std over a sample of `image_dir/<filenames>` images.
+    Returns (mean_tuple, std_tuple) with length 3 for BF or `fl_channels` for FL.
+    """
+    rng = np.random.default_rng(seed)
+    if len(filenames) > sample_size:
+        idx = rng.choice(len(filenames), size=sample_size, replace=False)
+        sample = [filenames[i] for i in idx]
+    else:
+        sample = list(filenames)
+
+    n_channels = 3 if modality == 'BF' else fl_channels
+    target_mode = 'RGBA' if (modality == 'FL' and fl_channels == 4) else 'RGB'
+
+    sums = np.zeros(n_channels, dtype=np.float64)
+    sqs = np.zeros(n_channels, dtype=np.float64)
+    count = 0
+    for nm in sample:
+        path = os.path.join(image_dir, nm)
+        arr = np.asarray(Image.open(path).convert(target_mode), dtype=np.float32) / 255.0
+        sums += arr.reshape(-1, n_channels).sum(axis=0)
+        sqs += (arr.reshape(-1, n_channels) ** 2).sum(axis=0)
+        count += arr.shape[0] * arr.shape[1]
+    mean = sums / count
+    std = np.sqrt(np.maximum(sqs / count - mean ** 2, 1e-12))
+    return tuple(mean.tolist()), tuple(std.tolist())

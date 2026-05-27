@@ -7,8 +7,8 @@ data:
   sample_submission_csv: /root/.cache/kagglehub/competitions/multimodal-cancer-classification-challenge-2026/sampleSubmission.csv
 
 split:
-  n_folds: 3
-  seed: 42
+  n_folds: 2                          # only 12 patients -- 2 folds is the right call
+  seed: 0
 
 model:
   type: early_fusion_concat
@@ -16,37 +16,35 @@ model:
   img_size: 128
 
 training:
-  epochs: 5
-  batch_size: 256
-  accum_steps: 1                      # effective batch = batch_size * accum_steps = 256
+  epochs: 15
+  batch_size: 128
   num_workers: 8
   optimizer: AdamW
-  lr: 2.0e-5                          # lower than ImageNet-init runs since we start from a pretrained-on-distribution backbone
-  weight_decay: 0.3                   # heavy WD to fight per-patient overfitting
+  lr: 8.0e-5
+  weight_decay: 0.15                  # mild L2, not a wall
   scheduler: CosineAnnealingLR
   eta_min: 1.0e-7
-  mixup_alpha: 1.0
-  class_weights: [0.61, 0.39]
-  freeze_backbone_epochs: 1
+  dropout: 0.15                       # light dropout before the classifier
+  mixup_alpha: 0.4                    # gentle mixup; class weights + per-sample BCE handle imbalance
 
 pretraining:
-  enabled: true                       # if true, train.py loads the pretrained backbone before supervised training
+  enabled: true                      # SimCLR pretraining off in the Best.py reproduction
   epochs: 10
-  batch_size: 512
-  accum_steps: 2                      # effective batch = batch_size * accum_steps = 512 (more negatives → better SimCLR)
+  batch_size: 1024
+  accum_steps: 2
   num_workers: 8
   prefetch_factor: 4
-  subsample_frac: 1.0                 # A100 is fast enough to use the full pool
+  subsample_frac: 1.0
   lr: 1.5e-4
   weight_decay: 0.05
   temperature: 0.1
-  proj_dim: 128                       # NT-Xent projection-head output dim
-  proj_hidden_dim: 512                # NT-Xent projection-head hidden dim
-  freeze_strategy: partial            # 'partial' (stages 2-3 + stem) | 'none' (all trainable)
+  proj_dim: 128
+  proj_hidden_dim: 512
+  freeze_strategy: partial
   checkpoint_path: outputs/checkpoints/pretrained_ef_backbone.pt
 
 inference:
-  tta: true                           # 8-view D4 (rotations + h-flip) averaged at test time
+  tta: true                           # 4-view (h-flip / v-flip / both) averaged at test time
 
 output:
   checkpoint_dir: outputs/checkpoints

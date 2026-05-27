@@ -239,42 +239,34 @@ class CrossAttentionFusionModel(nn.Module):
 ### Early-fusion channel-concatenation model
 
 class EarlyFusionConcatModel(nn.Module):
-    """6-channel early fusion: BF and FL are concatenated along the channel
-    dimension and fed to a single ConvNeXt V2-Tiny backbone whose stem has
-    been replaced with a 6-channel patch-embedding conv. The new stem is
-    initialized by duplicating the pretrained 3-channel weights across the
-    BF and FL halves and dividing by 2 to preserve activation magnitude.
+    """N-channel early fusion: BF (3-ch) and FL (3- or 4-ch) are concatenated
+    along the channel dim and fed to a single ConvNeXt V2 backbone whose stem
+    has been patched for `total_channels` input channels.
+
+    Stem init: pretrained 3-channel weights are kept exactly on the BF half;
+    extra channels (FL_3 in the 6-ch case, or FL_3 + FL_4 in the 7-ch case)
+    are initialized from the channel-mean of the pretrained weight.
     """
 
     def __init__(self, backbone_name='convnextv2_tiny.fcmae_ft_in22k_in1k',
-                 pretrained=True):
+                 pretrained=True, total_channels=6, dropout=0.15):
         super().__init__()
+        self.total_channels = total_channels
         self.backbone = timm.create_model(
             backbone_name, pretrained=pretrained, num_classes=0,
         )
-        self._patch_stem_for_6ch()
+        self._patch_stem(total_channels)
         feat_dim = self.backbone.num_features
+        self.head = nn.Sequential(nn.Dropout(dropout), nn.Linear(feat_dim, 1))
 
-        self.head = nn.Sequential(
-            nn.LayerNorm(feat_dim),
-            nn.Dropout(0.4),
-            nn.Linear(feat_dim, 256),
-            nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 1),
-        )
-
-    def _patch_stem_for_6ch(self):
-        """Replace the 3-channel stem conv with a 6-channel equivalent.
-        Initializes new weight as concat of original|original/2 so the
-        identity-ish behavior on duplicated input is preserved."""
+    def _patch_stem(self, in_channels):
         stem = self.backbone.stem
         old_conv = stem[0] if isinstance(stem, nn.Sequential) else stem.conv
         assert isinstance(old_conv, nn.Conv2d), "unexpected stem layout"
         assert old_conv.in_channels == 3, f"expected 3-channel stem, got {old_conv.in_channels}"
 
         new_conv = nn.Conv2d(
-            in_channels=6,
+            in_channels=in_channels,
             out_channels=old_conv.out_channels,
             kernel_size=old_conv.kernel_size,
             stride=old_conv.stride,
@@ -282,8 +274,14 @@ class EarlyFusionConcatModel(nn.Module):
             bias=old_conv.bias is not None,
         )
         with torch.no_grad():
-            w = old_conv.weight  # [C_out, 3, k, k]
-            new_conv.weight.copy_(torch.cat([w, w], dim=1) * 0.5)  # [C_out, 6, k, k]
+            if in_channels >= 3:
+                new_conv.weight[:, :3] = old_conv.weight
+                if in_channels > 3:
+                    new_conv.weight[:, 3:] = old_conv.weight.mean(
+                        dim=1, keepdim=True
+                    ).repeat(1, in_channels - 3, 1, 1)
+            else:
+                new_conv.weight.copy_(old_conv.weight[:, :in_channels])
             if old_conv.bias is not None:
                 new_conv.bias.copy_(old_conv.bias)
 
@@ -292,34 +290,9 @@ class EarlyFusionConcatModel(nn.Module):
         else:
             stem.conv = new_conv
 
-    def forward(self, bf, fl):
-        x = torch.cat([bf, fl], dim=1)  # [B, 6, H, W]
-        x = self.backbone(x)            # [B, feat_dim]
+    def forward(self, x):
+        x = self.backbone(x)
         return self.head(x)
-
-    def set_freeze_strategy(self, strategy: str):
-        """Backbone freeze control. The (6-channel) stem and head stay trainable.
-        - 'warmup':  backbone stages frozen, stem + head train
-        - 'partial': stages 0-1 frozen, stages 2-3 + norms + stem + head train
-        - 'none':    everything trainable
-        """
-        for p in self.head.parameters():
-            p.requires_grad = True
-
-        for name, p in self.backbone.named_parameters():
-            is_stem = name.startswith('stem')
-            if strategy == 'warmup':
-                p.requires_grad = is_stem
-            elif strategy == 'partial':
-                p.requires_grad = (
-                    is_stem
-                    or any(k in name for k in ['stages.2', 'stages.3'])
-                    or ('norm' in name and 'stages.0' not in name and 'stages.1' not in name)
-                )
-            elif strategy == 'none':
-                p.requires_grad = True
-            else:
-                raise ValueError(f"unknown freeze strategy: {strategy!r}")
             
 
 
