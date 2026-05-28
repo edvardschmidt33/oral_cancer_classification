@@ -16,19 +16,19 @@ model:
   img_size: 128
 
 training:
-  epochs: 15
-  batch_size: 128
+  epochs: 30
+  batch_size: 256
   num_workers: 8
   optimizer: AdamW
   lr: 8.0e-5
   weight_decay: 0.15                  # mild L2, not a wall
   scheduler: CosineAnnealingLR
   eta_min: 1.0e-7
-  dropout: 0.15                       # light dropout before the classifier
-  mixup_alpha: 0.4                    # gentle mixup; class weights + per-sample BCE handle imbalance
+  dropout: 0.20                       # light dropout before the classifier
+  mixup_alpha: 0.5                    # gentle mixup; class weights + per-sample BCE handle imbalance
 
 pretraining:
-  enabled: true                      # SimCLR pretraining off in the Best.py reproduction
+  enabled: false                      # SimCLR pretraining off in the Best.py reproduction
   epochs: 10
   batch_size: 1024
   accum_steps: 2
