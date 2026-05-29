@@ -36,6 +36,7 @@ def build_test_loader(cfg, bf_mean, bf_std, fl_mean, fl_std, fl_channels):
         bf_dir=cfg['data']['bf_test_dir'],
         fl_dir=cfg['data']['fl_test_dir'],
         size=cfg['model']['img_size'],
+        crop_size=cfg['model'].get('crop_size'),
         bf_mean=bf_mean, bf_std=bf_std,
         fl_mean=fl_mean, fl_std=fl_std,
         fl_channels=fl_channels,

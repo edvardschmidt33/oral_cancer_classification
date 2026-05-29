@@ -14,9 +14,10 @@ model:
   type: early_fusion_concat
   backbone: convnextv2_tiny.fcmae_ft_in22k_in1k
   img_size: 128
+  crop_size: 64                       # center crop on the cell (after geometry) -- removes periphery, model input is 64x64
 
 training:
-  epochs: 30
+  epochs: 16
   batch_size: 256
   num_workers: 8
   optimizer: AdamW

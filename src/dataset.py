@@ -15,7 +15,7 @@ class OralCancerDataset(Dataset):
     """
 
     def __init__(self, filenames, labels, bf_dir, fl_dir,
-                 size=128,
+                 size=128, crop_size=None,
                  bf_mean=None, bf_std=None, fl_mean=None, fl_std=None,
                  fl_channels=3,
                  bf_color=None, fl_color=None, geo_transform=None,
@@ -31,6 +31,9 @@ class OralCancerDataset(Dataset):
         self.bf_color = bf_color
         self.fl_color = fl_color
         self.geo_transform = geo_transform
+        # Final center crop runs on the concatenated tensor (after geometry) so
+        # rotation/affine black corners are cropped away and BF/FL stay aligned.
+        self.crop = T.CenterCrop(crop_size) if crop_size else None
 
         bf_steps = [T.Resize((size, size), antialias=True), T.ToTensor()]
         if bf_mean is not None and bf_std is not None:
@@ -64,6 +67,9 @@ class OralCancerDataset(Dataset):
 
         if self.geo_transform is not None:
             x = self.geo_transform(x)
+
+        if self.crop is not None:
+            x = self.crop(x)
 
         if self.labels is not None:
             label = torch.tensor(self.labels[index], dtype=torch.float32)

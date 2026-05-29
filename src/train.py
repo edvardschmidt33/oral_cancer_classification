@@ -39,12 +39,13 @@ def load_config(path):
 def build_dataloaders(cfg, train_idx, val_idx, filenames, labels,
                       bf_mean, bf_std, fl_mean, fl_std, fl_channels):
     size = cfg['model']['img_size']
+    crop_size = cfg['model'].get('crop_size')
     train_ds = OralCancerDataset(
         filenames=[filenames[i] for i in train_idx],
         labels=[labels[i] for i in train_idx],
         bf_dir=cfg['data']['bf_train_dir'],
         fl_dir=cfg['data']['fl_train_dir'],
-        size=size,
+        size=size, crop_size=crop_size,
         bf_mean=bf_mean, bf_std=bf_std,
         fl_mean=fl_mean, fl_std=fl_std,
         fl_channels=fl_channels,
@@ -58,7 +59,7 @@ def build_dataloaders(cfg, train_idx, val_idx, filenames, labels,
         labels=[labels[i] for i in val_idx],
         bf_dir=cfg['data']['bf_train_dir'],
         fl_dir=cfg['data']['fl_train_dir'],
-        size=size,
+        size=size, crop_size=crop_size,
         bf_mean=bf_mean, bf_std=bf_std,
         fl_mean=fl_mean, fl_std=fl_std,
         fl_channels=fl_channels,
