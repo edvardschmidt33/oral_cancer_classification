@@ -226,13 +226,24 @@ def main():
     )
 
     total_channels = 3 + fl_channels
+    # Effective spatial size the backbone will actually see: crop_size if set,
+    # otherwise the resize target. Matters for Swin's window/position-bias init.
+    eff_img_size = cfg['model'].get('crop_size') or cfg['model']['img_size']
+    upsample_to = cfg['model'].get('upsample_to')
     model = EarlyFusionConcatModel(
         backbone_name=cfg['model']['backbone'],
         pretrained=True,
         total_channels=total_channels,
         dropout=cfg['training'].get('dropout', 0.15),
+        img_size=eff_img_size,
+        upsample_to=upsample_to,
     ).to(device)
     print(f"total params: {sum(p.numel() for p in model.parameters()):,}")
+    # Verify the stem patch took effect (spec: "stem conv now has in_channels == 6").
+    first_conv = next(m for m in model.backbone.modules() if isinstance(m, torch.nn.Conv2d))
+    print(f"first conv ({model.stem_name}): in_channels={first_conv.in_channels}, "
+          f"out_channels={first_conv.out_channels}, kernel={first_conv.kernel_size}, "
+          f"stride={first_conv.stride}")
 
     pre = cfg.get('pretraining', {})
     if pre.get('enabled', False):
@@ -280,9 +291,11 @@ def main():
 
     ckpt_dir = cfg['output']['checkpoint_dir']
     os.makedirs(ckpt_dir, exist_ok=True)
+    run_name = cfg['output'].get('run_name')
+    prefix = f'{run_name}_' if run_name else ''
     best_smoothed = -1.0
-    best_path = os.path.join(ckpt_dir, f'fold{args.fold}_best.pt')
-    last_path = os.path.join(ckpt_dir, f'fold{args.fold}_last.pt')
+    best_path = os.path.join(ckpt_dir, f'{prefix}fold{args.fold}_best.pt')
+    last_path = os.path.join(ckpt_dir, f'{prefix}fold{args.fold}_last.pt')
     auc_history = []
 
     mixup_alpha = cfg['training']['mixup_alpha']

@@ -53,7 +53,7 @@ class SimCLRAugmentation:
             T.RandomRotation(90),
         ])
         self.bf_color = T.Compose([
-            T.ColorJitter(brightness=0.5, contrast=0.3, saturation=0.2, hue=0.1),
+            T.ColorJitter(brightness=0.5, contrast=0.3, saturation=0.2, hue=0.0),
             T.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
         ])
         self.fl_color = T.Compose([

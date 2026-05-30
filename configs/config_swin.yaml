@@ -6,30 +6,34 @@ data:
   labels_csv:   /root/.cache/kagglehub/competitions/multimodal-cancer-classification-challenge-2026/train.csv
   sample_submission_csv: /root/.cache/kagglehub/competitions/multimodal-cancer-classification-challenge-2026/sampleSubmission.csv
 
+# split MUST match the existing ConvNeXt run (same n_folds, same seed) so OOF
+# comparison is valid -- copied verbatim from configs/config_ef.yaml.
 split:
-  n_folds: 3                          # only 12 patients -- 2 folds is the right call
+  n_folds: 3
   seed: 0
 
 model:
   type: early_fusion_concat
-  backbone: convnextv2_tiny.fcmae_ft_in22k_in1k
-  img_size: 128
-  crop_size: 128                       # center crop on the cell (after geometry) -- removes periphery, model input is 64x64
+  backbone: swinv2_tiny_window8_256   # <-- the only experimental change vs. config_ef.yaml
+  img_size: 128                       # Swin window=8 divides 128 across stages cleanly; no crop
 
+
+# Training recipe copied verbatim from configs/config_ef.yaml. Do NOT tune
+# independently of the ConvNeXt config -- it would invalidate the comparison.
 training:
   epochs: 16
   batch_size: 256
   num_workers: 8
   optimizer: AdamW
   lr: 8.0e-5
-  weight_decay: 0.15                  # mild L2, not a wall
+  weight_decay: 0.15
   scheduler: CosineAnnealingLR
   eta_min: 1.0e-7
-  dropout: 0.20                       # light dropout before the classifier
-  mixup_alpha: 0.4                    # gentle mixup; class weights + per-sample BCE handle imbalance
+  dropout: 0.20
+  mixup_alpha: 0.4
 
 pretraining:
-  enabled: false                      # SimCLR pretraining off in the Best.py reproduction
+  enabled: false                      # SimCLR pretraining off for this experiment
   epochs: 10
   batch_size: 1024
   accum_steps: 2
@@ -42,11 +46,15 @@ pretraining:
   proj_dim: 128
   proj_hidden_dim: 512
   freeze_strategy: partial
-  checkpoint_path: outputs/checkpoints/pretrained_ef_backbone.pt
+  checkpoint_path: outputs/checkpoints/pretrained_swin_backbone.pt
 
 inference:
-  tta: true                           # 4-view (h-flip / v-flip / both) averaged at test time
+  tta: true                           # 4-view flips, identical to ConvNeXt inference
 
 output:
   checkpoint_dir: outputs/checkpoints
   submission_dir: outputs/submissions
+  oof_dir: outputs/oof
+  run_name: swin                      # checkpoints -> swin_fold{N}_{best,last}.pt
+                                      # OOF        -> swin_fold{N}_val.csv
+                                      # per-fold   -> swin_fold{N}[_tta].csv

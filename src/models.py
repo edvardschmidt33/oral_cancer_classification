@@ -238,62 +238,108 @@ class CrossAttentionFusionModel(nn.Module):
 
 ### Early-fusion channel-concatenation model
 
+def _model_needs_img_size(name: str) -> bool:
+    """timm transformer/Swin variants require an explicit `img_size` for
+    position-bias / window sizing; ConvNeXt v2 rejects the kwarg outright."""
+    n = name.lower()
+    return n.startswith('swin') or n.startswith('vit') or 'vit_' in n or 'swin_' in n
+
+
+def build_backbone(name, img_size=128, pretrained=True):
+    """Construct a headless timm backbone with global average pooling, so
+    `backbone(x)` returns (B, num_features) regardless of internal NCHW vs
+    (B, L, C) feature layout. This keeps ConvNeXt and Swin interchangeable
+    for downstream heads."""
+    kwargs = dict(pretrained=pretrained, num_classes=0, global_pool='avg')
+    if _model_needs_img_size(name):
+        kwargs['img_size'] = img_size
+    return timm.create_model(name, **kwargs)
+
+
+def patch_first_conv_to_nch(model, in_channels):
+    """Replace the model's first Conv2d (BF stem / patch-embed) with an
+    `in_channels`-channel version.
+
+    Stem init: pretrained 3ch weights are preserved exactly on channels [0:3]
+    (BF half); extra channels are initialized from the channel-mean of the
+    pretrained weight. Identical scheme regardless of backbone, so ConvNeXt
+    and Swin share the exact same stem-patch behavior."""
+    first_name, first = next(
+        (n, m) for n, m in model.named_modules() if isinstance(m, nn.Conv2d)
+    )
+    assert first.in_channels == 3, (
+        f"expected 3-channel first conv at {first_name!r}, got {first.in_channels}"
+    )
+
+    new = nn.Conv2d(
+        in_channels, first.out_channels,
+        kernel_size=first.kernel_size,
+        stride=first.stride,
+        padding=first.padding,
+        bias=first.bias is not None,
+    )
+    with torch.no_grad():
+        if in_channels >= 3:
+            new.weight[:, :3] = first.weight
+            if in_channels > 3:
+                new.weight[:, 3:] = first.weight.mean(
+                    dim=1, keepdim=True
+                ).repeat(1, in_channels - 3, 1, 1)
+        else:
+            new.weight.copy_(first.weight[:, :in_channels])
+        if first.bias is not None:
+            new.bias.copy_(first.bias)
+
+    parent = model
+    *parents, attr = first_name.split('.')
+    for p in parents:
+        parent = parent[int(p)] if p.isdigit() else getattr(parent, p)
+    if attr.isdigit():
+        parent[int(attr)] = new
+    else:
+        setattr(parent, attr, new)
+    return model, first_name
+
+
 class EarlyFusionConcatModel(nn.Module):
     """N-channel early fusion: BF (3-ch) and FL (3- or 4-ch) are concatenated
-    along the channel dim and fed to a single ConvNeXt V2 backbone whose stem
-    has been patched for `total_channels` input channels.
+    along the channel dim and fed to a single timm backbone whose first conv
+    (stem / patch-embed) has been patched for `total_channels` input channels.
 
     Stem init: pretrained 3-channel weights are kept exactly on the BF half;
-    extra channels (FL_3 in the 6-ch case, or FL_3 + FL_4 in the 7-ch case)
-    are initialized from the channel-mean of the pretrained weight.
+    extra channels are initialized from the channel-mean of the pretrained
+    weight. Backbone runs with global_pool='avg' so the output is (B, num_features)
+    regardless of architecture (ConvNeXt NCHW vs Swin token layout).
     """
 
     def __init__(self, backbone_name='convnextv2_tiny.fcmae_ft_in22k_in1k',
-                 pretrained=True, total_channels=6, dropout=0.15):
+                 pretrained=True, total_channels=6, dropout=0.15, img_size=128,
+                 upsample_to=None):
         super().__init__()
         self.total_channels = total_channels
-        self.backbone = timm.create_model(
-            backbone_name, pretrained=pretrained, num_classes=0,
+        self.backbone_name = backbone_name
+        # `upsample_to`: if set, the input is bilinearly resized to this spatial
+        # size at the start of forward. Used for Swin when the dataset crop
+        # (e.g. 96) is not divisible by Swin's window across all stages -- the
+        # data crop stays identical to ConvNeXt's, only Swin's internal feature
+        # grid gets adapted to a window-compatible size (e.g. 128).
+        self.upsample_to = upsample_to
+        backbone_img_size = upsample_to if upsample_to else img_size
+        self.backbone = build_backbone(
+            backbone_name, img_size=backbone_img_size, pretrained=pretrained,
         )
-        self._patch_stem(total_channels)
+        _, stem_name = patch_first_conv_to_nch(self.backbone, total_channels)
+        self.stem_name = stem_name
         feat_dim = self.backbone.num_features
         self.head = nn.Sequential(nn.Dropout(dropout), nn.Linear(feat_dim, 1))
 
-    def _patch_stem(self, in_channels):
-        stem = self.backbone.stem
-        old_conv = stem[0] if isinstance(stem, nn.Sequential) else stem.conv
-        assert isinstance(old_conv, nn.Conv2d), "unexpected stem layout"
-        assert old_conv.in_channels == 3, f"expected 3-channel stem, got {old_conv.in_channels}"
-
-        new_conv = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=old_conv.out_channels,
-            kernel_size=old_conv.kernel_size,
-            stride=old_conv.stride,
-            padding=old_conv.padding,
-            bias=old_conv.bias is not None,
-        )
-        with torch.no_grad():
-            if in_channels >= 3:
-                new_conv.weight[:, :3] = old_conv.weight
-                if in_channels > 3:
-                    new_conv.weight[:, 3:] = old_conv.weight.mean(
-                        dim=1, keepdim=True
-                    ).repeat(1, in_channels - 3, 1, 1)
-            else:
-                new_conv.weight.copy_(old_conv.weight[:, :in_channels])
-            if old_conv.bias is not None:
-                new_conv.bias.copy_(old_conv.bias)
-
-        if isinstance(stem, nn.Sequential):
-            stem[0] = new_conv
-        else:
-            stem.conv = new_conv
-
     def forward(self, x):
-        x = self.backbone(x)
-        return self.head(x)
-            
+        if self.upsample_to is not None and x.shape[-1] != self.upsample_to:
+            x = F.interpolate(x, size=self.upsample_to, mode='bilinear',
+                              align_corners=False)
+        feat = self.backbone(x)
+        return self.head(feat)
+
 
 
 class SimCLRModel(nn.Module):

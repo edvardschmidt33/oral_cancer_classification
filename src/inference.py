@@ -100,10 +100,16 @@ def main():
     use_tta = args.tta if args.tta is not None else bool(cfg.get('inference', {}).get('tta', False))
     print(f"TTA: {'on (4-view: flips)' if use_tta else 'off'}")
 
+    run_name = cfg['output'].get('run_name')
+    prefix = f'{run_name}_' if run_name else ''
+    out_dir = cfg['output']['submission_dir']
+    os.makedirs(out_dir, exist_ok=True)
+
     fold_probs = []
     filenames = None
     for fold in args.folds:
-        ckpt_path = os.path.join(cfg['output']['checkpoint_dir'], f'fold{fold}_{args.ckpt}.pt')
+        ckpt_path = os.path.join(cfg['output']['checkpoint_dir'],
+                                 f'{prefix}fold{fold}_{args.ckpt}.pt')
         print(f"loading {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
@@ -113,6 +119,7 @@ def main():
         fl_std = ckpt['fl_std']
         fl_channels = ckpt['fl_channels']
         total_channels = 3 + fl_channels
+        eff_img_size = cfg['model'].get('crop_size') or cfg['model']['img_size']
 
         loader, filenames = build_test_loader(
             cfg, bf_mean, bf_std, fl_mean, fl_std, fl_channels,
@@ -123,6 +130,8 @@ def main():
             pretrained=False,
             total_channels=total_channels,
             dropout=cfg['training'].get('dropout', 0.15),
+            img_size=eff_img_size,
+            upsample_to=cfg['model'].get('upsample_to'),
         ).to(device)
         model.load_state_dict(ckpt['model_state'])
 
@@ -139,10 +148,9 @@ def main():
 
     avg = np.mean(np.stack(fold_probs, axis=0), axis=0)
 
-    out_dir = cfg['output']['submission_dir']
-    os.makedirs(out_dir, exist_ok=True)
     suffix = f'_{args.ckpt}' + ('_tta' if use_tta else '')
-    out_path = args.output or os.path.join(out_dir, f'submission{suffix}.csv')
+    default_name = f'{prefix}submission{suffix}.csv' if prefix else f'submission{suffix}.csv'
+    out_path = args.output or os.path.join(out_dir, default_name)
     pd.DataFrame({'Name': filenames, 'Diagnosis': avg}).to_csv(out_path, index=False)
     print(f"wrote {len(filenames)} predictions to {out_path}")
     print(f"score stats: min={avg.min():.4f} max={avg.max():.4f} "
