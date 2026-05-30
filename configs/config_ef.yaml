@@ -7,7 +7,7 @@ data:
   sample_submission_csv: /root/.cache/kagglehub/competitions/multimodal-cancer-classification-challenge-2026/sampleSubmission.csv
 
 split:
-  n_folds: 3                          # only 12 patients -- 2 folds is the right call
+  n_folds: 2                          # only 12 patients -- 2 folds is the right call
   seed: 0
 
 model:
