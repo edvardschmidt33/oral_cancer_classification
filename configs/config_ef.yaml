@@ -1,10 +1,10 @@
 data:
-  bf_train_dir: /root/.cache/kagglehub/competitions/multimodal-cancer-classification-challenge-2026/BF/train
-  fl_train_dir: /root/.cache/kagglehub/competitions/multimodal-cancer-classification-challenge-2026/FL/train
-  bf_test_dir:  /root/.cache/kagglehub/competitions/multimodal-cancer-classification-challenge-2026/BF/test
-  fl_test_dir:  /root/.cache/kagglehub/competitions/multimodal-cancer-classification-challenge-2026/FL/test
-  labels_csv:   /root/.cache/kagglehub/competitions/multimodal-cancer-classification-challenge-2026/train.csv
-  sample_submission_csv: /root/.cache/kagglehub/competitions/multimodal-cancer-classification-challenge-2026/sampleSubmission.csv
+  bf_train_dir: dataset/BF/train
+  fl_train_dir: dataset/FL/train
+  bf_test_dir:  dataset/BF/test
+  fl_test_dir:  dataset/FL/test
+  labels_csv:   dataset/train.csv
+  sample_submission_csv: dataset/sampleSubmission.csv
 
 split:
   n_folds: 2                          # only 12 patients -- 2 folds is the right call
