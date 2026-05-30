@@ -20,11 +20,60 @@ from torch.utils.data import DataLoader
 
 from src.dataset import OralCancerDataset
 from src.models import EarlyFusionConcatModel
+from src.utils import compute_norm_stats, get_patient_splits, probe_fl_channels, set_seed
 
 
 def load_config(path):
     with open(path, 'r') as f:
         return yaml.safe_load(f)
+
+
+def unwrap_checkpoint(ckpt):
+    """Accept either a wrapped payload ({'model_state': ..., 'bf_mean': ...})
+    or a raw state_dict (just weights). Returns (payload_dict, model_state)."""
+    if isinstance(ckpt, dict) and 'model_state' in ckpt:
+        return ckpt, ckpt['model_state']
+    return {}, ckpt
+
+
+def resolve_fold_stats(payload, cfg, fold, seed):
+    """Read BF/FL norm stats and fl_channels from the checkpoint payload if
+    present; otherwise recompute them from the training data using the same
+    per-fold split as `train.py`. Lets inference work on raw weight dumps that
+    don't embed the stats (e.g. older checkpoints uploaded from Kaggle)."""
+    fl_channels = payload.get('fl_channels')
+    if fl_channels is None:
+        fl_channels = probe_fl_channels(cfg['data']['fl_train_dir'])
+        print(f"  fl_channels not in checkpoint -> probed: {fl_channels}")
+
+    stat_keys = ('bf_mean', 'bf_std', 'fl_mean', 'fl_std')
+    if all(k in payload for k in stat_keys):
+        return (payload['bf_mean'], payload['bf_std'],
+                payload['fl_mean'], payload['fl_std'], fl_channels)
+
+    print("  normalization stats missing from checkpoint -> recomputing from labels_csv")
+    print(f"  (using current config split: n_folds={cfg['split']['n_folds']}, seed={seed})")
+    set_seed(seed)
+    labels_df = pd.read_csv(cfg['data']['labels_csv'])
+    filenames = labels_df['Name'].tolist()
+    labels = labels_df['Diagnosis'].astype(int).tolist()
+    folds = get_patient_splits(
+        filenames, labels,
+        n_folds=cfg['split']['n_folds'],
+        seed=seed,
+    )
+    train_idx, _ = folds[fold]
+    train_names = [filenames[i] for i in train_idx]
+    bf_mean, bf_std = compute_norm_stats(
+        cfg['data']['bf_train_dir'], train_names,
+        modality='BF', sample_size=2000, seed=seed,
+    )
+    fl_mean, fl_std = compute_norm_stats(
+        cfg['data']['fl_train_dir'], train_names,
+        modality='FL', fl_channels=fl_channels,
+        sample_size=2000, seed=seed,
+    )
+    return bf_mean, bf_std, fl_mean, fl_std, fl_channels
 
 
 def build_test_loader(cfg, bf_mean, bf_std, fl_mean, fl_std, fl_channels):
@@ -112,12 +161,10 @@ def main():
                                  f'{prefix}fold{fold}_{args.ckpt}.pt')
         print(f"loading {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-
-        bf_mean = ckpt['bf_mean']
-        bf_std = ckpt['bf_std']
-        fl_mean = ckpt['fl_mean']
-        fl_std = ckpt['fl_std']
-        fl_channels = ckpt['fl_channels']
+        payload, model_state = unwrap_checkpoint(ckpt)
+        bf_mean, bf_std, fl_mean, fl_std, fl_channels = resolve_fold_stats(
+            payload, cfg, fold, seed=cfg['split']['seed'],
+        )
         total_channels = 3 + fl_channels
         eff_img_size = cfg['model'].get('crop_size') or cfg['model']['img_size']
 
@@ -133,12 +180,12 @@ def main():
             img_size=eff_img_size,
             upsample_to=cfg['model'].get('upsample_to'),
         ).to(device)
-        model.load_state_dict(ckpt['model_state'])
+        model.load_state_dict(model_state)
 
         probs = predict(model, device, loader, use_tta=use_tta, use_amp=use_amp)
         fold_probs.append(probs)
-        sauc = ckpt.get('smoothed_auc', float('nan'))
-        cauc = ckpt.get('cell_auc', float('nan'))
+        sauc = payload.get('smoothed_auc', float('nan'))
+        cauc = payload.get('cell_auc', float('nan'))
         print(f"  fold {fold}: cell_auc={cauc:.4f}, smoothed_auc={sauc:.4f}, "
               f"predicted {len(probs)} cells")
 
